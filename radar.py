@@ -1,0 +1,1659 @@
+#!/usr/bin/env python3
+"""
+Hydra-Radar - OSINT monitor for German commercial register publications.
+
+Pipeline ("the funnel"):
+    sources  ->  Step 1: sector filter (energy)  ->  Step 2: Swiss-connection
+    detection (text + optional OpenCorporates enrichment)  ->  SQLite dedup
+    ->  Discord webhook alert
+
+Designed to run unattended once or twice a day from cron on a headless
+Debian server. All behaviour is driven by config.json (see README.md).
+
+Exit codes: 0 = ok, 1 = finished but at least one source/alert failed,
+            2 = configuration / startup error, 3 = another run holds the lock.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import dataclasses
+import datetime as dt
+import hashlib
+import html
+import json
+import logging
+import logging.handlers
+import os
+import random
+import re
+import sqlite3
+import sys
+import time
+import unicodedata
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import quote
+
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+__version__ = "1.0.0"
+
+log = logging.getLogger("hydra_radar")
+BASE_DIR = Path(__file__).resolve().parent
+
+# --------------------------------------------------------------------------
+# Defaults. config.json is deep-merged on top of this, so it may be partial.
+# --------------------------------------------------------------------------
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "discord": {
+        "webhook_url": "",
+        "username": "Hydra-Radar",
+        "mention": "",
+        "max_text_chars": 3000,
+        "attach_full_text": True,
+    },
+    "database": {"path": "data/hydra_radar.sqlite3"},
+    "logging": {"dir": "data/logs", "level": "INFO", "max_bytes": 5_242_880, "backups": 10},
+    "run": {
+        "lookback_days": 4,
+        "alert_once_per_company": True,
+        "require_event_match": False,
+        "max_findings_per_alert": 15,
+        "lock_file": "data/radar.lock",
+    },
+    "http": {
+        "timeout": 30,
+        "retries": 4,
+        "backoff_factor": 2.0,
+        "min_delay_seconds": 1.0,
+        "user_agents": [
+            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        ],
+    },
+    "sources": {
+        "github_snapshots": {"enabled": True, "url_template": ""},
+        "handelsregister": {"enabled": False},
+        "opencorporates": {"enabled": False},
+        "local": {"enabled": False},
+    },
+    "detection": {
+        "context_chars": 90,
+        "sector_keywords": ["Energieversorgung", "Energiebelieferung", "Strom", "Gas"],
+        "sector_exclude": [],
+        "event_patterns": {},
+        "swiss_keywords": ["Schweiz", "Switzerland", "CH-", "Zug", "Stans", "Zürich",
+                           "Luzern", "Schwyz", "Nidwalden"],
+        "swiss_cities": [],
+        "swiss_ambiguous_cities": [],
+        "swiss_exclude": [],
+        "swiss_legal_forms": ["AG", "SA", "GmbH", "Sàrl", "Sagl", "S.A."],
+    },
+}
+
+GITHUB_SNAPSHOT_TEMPLATE = (
+    "https://raw.githubusercontent.com/coezbek/registerbekanntmachungen/main/"
+    "db/{yyyy}-{mm}/registerbekanntmachungen-{date}.json"
+)
+ENV_WEBHOOK = "HYDRA_DISCORD_WEBHOOK"
+ENV_OC_TOKEN = "OPENCORPORATES_API_TOKEN"
+
+REGISTER_TYPES = r"(?:HRA|HRB|GnR|GsR|PR|VR)"
+REGISTER_RE = re.compile(
+    rf"(?P<court>Amtsgericht\s+[A-ZÄÖÜ][\wäöüß.\-]*(?:\s+[A-ZÄÖÜ(][\wäöüß.\-()]*){{0,3}}?)\s+"
+    rf"(?P<type>{REGISTER_TYPES})\s+(?P<num>\d+(?:\s?[A-Z]{{1,2}}\b)?)"
+)
+DOB_RE = re.compile(r"\*\s?(\d{1,2}\.\d{1,2}\.\d{4})")
+
+
+class ConfigError(Exception):
+    pass
+
+
+class SourceError(Exception):
+    pass
+
+
+class NotifyError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if key.startswith("_"):  # "_comment" keys in config.json
+            continue
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def normalize_text(value: Optional[str]) -> str:
+    """Unescape entities, NFC-normalise umlauts, unify whitespace."""
+    if not value:
+        return ""
+    s = html.unescape(str(value))
+    s = unicodedata.normalize("NFC", s)
+    s = s.replace(" ", " ").replace(" ", " ").replace(" ", " ")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t\f\v]+", " ", s)
+    s = re.sub(r" *\n *", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def norm_key(value: str) -> str:
+    s = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def sha1(*parts: str) -> str:
+    return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def utcnow() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def daterange(start: dt.date, end: dt.date) -> Iterator[dt.date]:
+    day = start
+    while day <= end:
+        yield day
+        day += dt.timedelta(days=1)
+
+
+def parse_date(value: str) -> dt.date:
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return dt.datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(f"invalid date {value!r} (use YYYY-MM-DD or DD.MM.YYYY)")
+
+
+def truncate(text: str, limit: int, suffix: str = "…") -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - len(suffix))].rstrip() + suffix
+
+
+def discord_escape(text: str) -> str:
+    return re.sub(r"([\\*_~`|>])", r"\\\1", text)
+
+
+def extract_register(text: str) -> Tuple[str, str, str]:
+    """Return (court, register_type, 'HRB 12345') found in free text, or empties."""
+    m = REGISTER_RE.search(text or "")
+    if not m:
+        return "", "", ""
+    return m.group("court").strip(), m.group("type"), f"{m.group('type')} {m.group('num').strip()}"
+
+
+# --------------------------------------------------------------------------
+# Data model
+# --------------------------------------------------------------------------
+@dataclasses.dataclass
+class Announcement:
+    uid: str
+    source: str
+    company_name: str
+    text: str
+    published: str = ""
+    court: str = ""
+    register_type: str = ""
+    register_number: str = ""
+    announcement_type: str = ""
+    seat: str = ""
+    state: str = ""
+    url: str = ""
+    purpose: str = ""
+    event_hint: str = ""
+    meta: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.company_name = normalize_text(self.company_name)
+        self.text = normalize_text(self.text)
+        self.purpose = normalize_text(self.purpose)
+        if not self.register_number:
+            court, rtype, number = extract_register(self.text)
+            self.court = self.court or court
+            self.register_type, self.register_number = rtype, number
+
+    @property
+    def company_key(self) -> str:
+        if self.register_number and self.court:
+            court = norm_key(re.sub(r"(?i)amtsgericht", "", self.court))
+            return f"reg|{court}|{norm_key(self.register_number)}"
+        return self.name_key
+
+    @property
+    def name_key(self) -> str:
+        return "name|" + norm_key(self.company_name)
+
+    @property
+    def register_label(self) -> str:
+        parts = [p for p in (self.register_number, self.court) if p]
+        return " · ".join(parts) if parts else "n/a"
+
+
+@dataclasses.dataclass
+class Finding:
+    kind: str      # person | entity | identifier | keyword
+    summary: str   # human readable description of the Swiss connection
+    match: str     # exact matched text
+    context: str   # surrounding text with «match» marked
+    origin: str = "text"
+
+    def as_dict(self) -> Dict[str, str]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class Evaluation:
+    sector_hits: List[str]
+    events: List[str]
+    findings: List[Finding]
+    enrichment_text: str = ""
+
+    @property
+    def alert(self) -> bool:
+        return bool(self.sector_hits and self.findings)
+
+
+# --------------------------------------------------------------------------
+# Detection logic
+# --------------------------------------------------------------------------
+Pattern = Tuple[str, "re.Pattern[str]"]
+
+
+def compile_terms(terms: Iterable[str], mode: str) -> List[Pattern]:
+    """Compile config terms.
+
+    * ``re:<regex>`` -> regex, case-insensitive.
+    * plain term, mode ``substring`` -> case-insensitive anywhere (catches
+      compounds such as "Ökostrom", "Gasversorgung").
+    * plain term, mode ``word`` -> must not be glued to other letters
+      ("Zug" will not match "Bezug"). Capitalised terms match in their
+      exact case or in ALL CAPS ("Thun"/"THUN" but not the verb "thun");
+      all-uppercase terms ("CH-") only in caps, so "Bosch-..." is ignored.
+    """
+    compiled: List[Pattern] = []
+    for raw in terms or []:
+        term = str(raw)
+        if not term.strip():
+            continue
+        try:
+            if term.startswith("re:"):
+                compiled.append((term, re.compile(term[3:], re.IGNORECASE)))
+                continue
+            t = term.strip()
+
+            def esc(s: str) -> str:
+                return re.escape(s).replace(r"\ ", r"\s+")
+
+            body = esc(t)
+            flags = re.IGNORECASE
+            if mode == "word":
+                letters = [c for c in t if c.isalpha()]
+                if letters and all(c.isupper() for c in letters):
+                    flags = 0
+                elif t[:1].isupper():
+                    body = f"(?:{esc(t)}|{esc(t.upper())})"
+                    flags = 0
+                if t[0].isalnum():
+                    body = r"(?<![\w])" + body
+                if t[-1].isalnum():
+                    body = body + r"(?![\w])"
+            compiled.append((t, re.compile(body, flags)))
+        except re.error as exc:
+            raise ConfigError(f"invalid detection pattern {term!r}: {exc}") from exc
+    return compiled
+
+
+def mask(text: str, patterns: Sequence[Pattern]) -> str:
+    """Blank out excluded phrases while keeping string offsets stable."""
+    for _, pat in patterns:
+        text = pat.sub(lambda m: " " * len(m.group(0)), text)
+    return text
+
+
+def spans_overlap(span: Tuple[int, int], spans: Sequence[Tuple[int, int]]) -> bool:
+    return any(span[0] < e and s < span[1] for s, e in spans)
+
+
+class Funnel:
+    LEADING_NOISE = re.compile(
+        r"^(?:(?:die|der|das|dem|den|des|the|firma|gesellschafterin|gesellschafter|"
+        r"alleingesellschafterin|gründerin|inhaberin|komplementärin|zweigniederlassung|"
+        r"übertragende|übernehmende|aufnehmende|rechtsträgerin|mit|von|und|als)\s+)+",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, cfg: Dict[str, Any]) -> None:
+        self.ctx = int(cfg.get("context_chars", 90))
+        self.sector = compile_terms(cfg.get("sector_keywords"), "substring")
+        self.sector_exclude = compile_terms(cfg.get("sector_exclude"), "substring")
+        self.events = {
+            name: compile_terms(pats, "substring")
+            for name, pats in (cfg.get("event_patterns") or {}).items()
+        }
+        cities = list(dict.fromkeys(cfg.get("swiss_cities") or []))
+        self.swiss_keywords = compile_terms(cfg.get("swiss_keywords"), "word")
+        self.swiss_cities = compile_terms(cities, "word")
+        self.ambiguous = compile_terms(cfg.get("swiss_ambiguous_cities"), "word")
+        self.swiss_exclude = compile_terms(cfg.get("swiss_exclude"), "substring")
+        self.strong = self.swiss_keywords + self.swiss_cities
+
+        city_names = [c for c in cities + [k for k in (cfg.get("swiss_keywords") or [])]
+                      if not c.startswith("re:") and c[:1].isalpha() and c[0].isupper()
+                      and not c.isupper() and c.lower() not in ("schweiz", "switzerland", "swiss", "suisse",
+                                            "svizzera", "kanton")]
+        all_cities = city_names + [c for c in (cfg.get("swiss_ambiguous_cities") or [])
+                                   if not c.startswith("re:")]
+        city_alt = "|".join(sorted((re.escape(c).replace(r"\ ", r"\s+") for c in city_names),
+                                   key=len, reverse=True)) or r"(?!x)x"
+        all_city_alt = "|".join(sorted((re.escape(c).replace(r"\ ", r"\s+") for c in all_cities),
+                                       key=len, reverse=True)) or r"(?!x)x"
+        amb = [c for c in (cfg.get("swiss_ambiguous_cities") or []) if not c.startswith("re:")]
+        amb_alt = "|".join(sorted((re.escape(c).replace(r"\ ", r"\s+") for c in amb),
+                                  key=len, reverse=True)) or r"(?!x)x"
+        forms = "|".join(sorted((re.escape(f) for f in cfg.get("swiss_legal_forms") or ["AG"]),
+                                key=len, reverse=True))
+        country = r"(?:Schweiz|Switzerland|Suisse|Svizzera|Swiss|CH)"
+        postal = r"(?:CH-?\s?)?(?:\d{4}\s+)?"
+        self.entity_re = re.compile(
+            rf"(?P<name>(?:[A-ZÄÖÜ0-9][\w&'’.+\-]*\s+(?:&\s+|und\s+)?){{1,7}}?(?:{forms}))(?![\w])"
+            rf"(?:\s*\(\s*{country}\s*\)"
+            rf"|\s*,\s*{postal}(?P<c1>{city_alt})(?![\w])(?:\s*[(/,]\s*{country}\)?)?"
+            rf"|\s+(?:mit\s+(?:Sitz|Satzungssitz|Hauptsitz|Verwaltungssitz)\s+in|in|aus)\s+"
+            rf"{postal}(?P<c2>{city_alt})(?![\w])(?:\s*[(/,]\s*{country}\)?)?"
+            rf"|(?:\s*,|\s+(?:mit\s+(?:Sitz|Satzungssitz|Hauptsitz|Verwaltungssitz)\s+in|in|aus))\s*"
+            rf"{postal}(?P<c3>{amb_alt})\s*[(/,]\s*{country}\)?"
+            rf"|\s*,\s*{country}(?![\w])"
+            rf"|\s+nach\s+schweizerischem\s+Recht)"
+        )
+        self.identifiers: List[Tuple[str, "re.Pattern[str]"]] = [
+            ("Swiss company UID", re.compile(r"(?<![\w])CHE[-\s]?\d{3}\.\d{3}\.\d{3}(?![\d])")),
+            ("Swiss postcode", re.compile(r"(?<![\w])CH-\s?\d{4}(?!\d)")),
+            ("Swiss address", re.compile(rf"(?<![\d.])\d{{4}}\s+(?:{all_city_alt})(?![\w])")),
+            ("Swiss phone number", re.compile(r"(?<![\w+])(?:\+|00)41[\s\-/]?\d{2}[\s\-/]?\d{3}")),
+            ("Swiss web/e-mail domain",
+             re.compile(r"(?:www\.|@|https?://)[\w.\-]+\.ch(?![\w.])", re.IGNORECASE)),
+        ]
+
+    # -- step 1 ------------------------------------------------------------
+    def sector_hits(self, ann: Announcement) -> List[str]:
+        text = "\n".join(p for p in (ann.company_name, ann.purpose, ann.text) if p)
+        masked = mask(text, self.sector_exclude)
+        hits: List[str] = []
+        for label, pat in self.sector:
+            m = pat.search(masked)
+            if m:
+                hits.append(m.group(0) if label.startswith("re:") else label)
+        return list(dict.fromkeys(hits))
+
+    def classify_events(self, ann: Announcement) -> List[str]:
+        found = [ann.event_hint] if ann.event_hint else []
+        text = "\n".join((ann.announcement_type, ann.text))
+        for name, pats in self.events.items():
+            if any(p.search(text) for _, p in pats):
+                found.append(name)
+        return list(dict.fromkeys(found))
+
+    # -- step 2 ------------------------------------------------------------
+    def _context(self, text: str, start: int, end: int) -> str:
+        a, b = max(0, start - self.ctx), min(len(text), end + self.ctx)
+        snippet = text[a:start] + "«" + text[start:end] + "»" + text[end:b]
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        return ("…" if a > 0 else "") + snippet + ("…" if b < len(text) else "")
+
+    def swiss_signal(self, masked_fragment: str) -> Optional[str]:
+        for label, pat in self.strong:
+            m = pat.search(masked_fragment)
+            if m:
+                return m.group(0)
+        for _, pat in self.identifiers:
+            m = pat.search(masked_fragment)
+            if m:
+                return m.group(0)
+        return None
+
+    def _persons(self, text: str, masked: str) -> Iterator[Tuple[Finding, Tuple[int, int]]]:
+        """Register-style person entries: 'Name, Vorname, Ort, *TT.MM.JJJJ' and
+        'Name, Vorname, *TT.MM.JJJJ, Ort/Schweiz'."""
+        role = ""
+        for seg in re.finditer(r"[^;\n]+", masked):
+            s0 = seg.start()
+            # split off role labels like "Geschäftsführer:" / "Prokura erloschen:"
+            pieces: List[Tuple[int, int]] = []
+            last = 0
+            seg_text = seg.group(0)
+            for colon in re.finditer(r":\s", seg_text):
+                label = seg_text[last:colon.start()].strip()
+                if label and not DOB_RE.search(label):
+                    label = re.split(r"[.;]\s+", label)[-1]
+                    role = " ".join(label.split()[-4:])[:60]
+                else:
+                    pieces.append((last, colon.start()))
+                last = colon.end()
+            pieces.append((last, len(seg_text)))
+            for ps, pe in pieces:
+                piece_m = seg_text[ps:pe]
+                if len(piece_m) > 260 or not DOB_RE.search(piece_m):
+                    continue
+                signal = self.swiss_signal(piece_m)
+                if not signal:
+                    continue
+                start, end = s0 + ps, s0 + pe
+                piece = text[start:end]
+                dob_m = DOB_RE.search(piece)
+                parts = [p.strip(" .") for p in piece.split(",") if p.strip(" .")]
+                masked_parts = [p.strip(" .") for p in piece_m.split(",") if p.strip(" .")]
+                location = [p for p, mp in zip(parts, masked_parts)
+                            if self.swiss_signal(mp) and not DOB_RE.search(p)]
+                names = [p for p, mp in zip(parts, masked_parts)
+                         if not DOB_RE.search(p) and p not in location][:2]
+                name = ", ".join(names) or "unknown"
+                dob = f" (*{dob_m.group(1)})" if dob_m else ""
+                who = role or "Person"
+                summary = f"{who}: {name}{dob} – residence: {', '.join(location) or signal}"
+                lead = len(piece) - len(piece.lstrip())
+                yield (Finding("person", summary, piece.strip(),
+                               self._context(text, start + lead, end)), (start, end))
+            if not seg_text.strip():
+                role = ""
+
+    def swiss_findings(self, text: str, origin: str = "text") -> List[Finding]:
+        text = normalize_text(text)
+        if not text:
+            return []
+        masked = mask(text, self.swiss_exclude)
+        findings: List[Finding] = []
+        covered: List[Tuple[int, int]] = []
+
+        for finding, span in self._persons(text, masked):
+            finding.origin = origin
+            findings.append(finding)
+            covered.append(span)
+
+        for m in self.entity_re.finditer(masked):
+            span = (m.start(), m.end())
+            if spans_overlap(span, covered):
+                continue
+            name = self.LEADING_NOISE.sub("", text[m.start("name"):m.end("name")]).strip()
+            grp = next((g for g in ("c1", "c2", "c3") if m.group(g)), None)
+            where = f"seat: {text[m.start(grp):m.end(grp)]}" if grp \
+                else text[m.end("name"):m.end()].strip(" ,()")
+            findings.append(Finding("entity", f"Swiss legal entity: {name} ({where})",
+                                    text[m.start():m.end()], self._context(text, *span), origin))
+            covered.append(span)
+
+        for label, pat in self.identifiers:
+            for m in pat.finditer(masked):
+                span = (m.start(), m.end())
+                if spans_overlap(span, covered):
+                    continue
+                findings.append(Finding("identifier", f"{label}: {text[m.start():m.end()]}",
+                                        text[m.start():m.end()], self._context(text, *span), origin))
+                covered.append(span)
+
+        keyword_hits: Dict[str, List[Tuple[int, int]]] = {}
+        for label, pat in self.strong:
+            for m in pat.finditer(masked):
+                span = (m.start(), m.end())
+                if not spans_overlap(span, covered):
+                    keyword_hits.setdefault(label, []).append(span)
+        strong_positions = [s for spans in keyword_hits.values() for s in spans] + covered
+        for label, pat in self.ambiguous:
+            for m in pat.finditer(masked):
+                span = (m.start(), m.end())
+                if spans_overlap(span, covered):
+                    continue
+                near = any(abs(s - span[0]) <= 120 for s, _ in strong_positions)
+                if near:
+                    keyword_hits.setdefault(label, []).append(span)
+        for label, spans in keyword_hits.items():
+            s, e = spans[0]
+            count = f" ({len(spans)}×)" if len(spans) > 1 else ""
+            findings.append(Finding("keyword", f"Swiss keyword “{text[s:e]}”{count}",
+                                    text[s:e], self._context(text, s, e), origin))
+        return findings
+
+    def evaluate(self, ann: Announcement, enricher: Optional["OpenCorporatesClient"] = None) -> Evaluation:
+        hits = self.sector_hits(ann)
+        events = self.classify_events(ann)
+        if not hits:
+            return Evaluation([], events, [])
+        findings = self.swiss_findings(
+            "\n".join(p for p in (ann.company_name, ann.purpose, ann.text) if p), "text")
+        extra = ""
+        if enricher is not None:
+            try:
+                extra = enricher.enrich(ann) or ""
+            except Exception as exc:  # enrichment must never kill the run
+                log.warning("OpenCorporates enrichment failed for %s: %s", ann.company_name, exc)
+            if extra:
+                seen = {f.match for f in findings}
+                findings += [f for f in self.swiss_findings(extra, "opencorporates")
+                             if f.match not in seen]
+        return Evaluation(hits, events, findings, extra)
+
+
+# --------------------------------------------------------------------------
+# HTTP layer: retries, rate limiting, User-Agent rotation
+# --------------------------------------------------------------------------
+class RateLimiter:
+    def __init__(self, per_hour: float = 0, min_delay: float = 0.0, jitter: float = 0.25) -> None:
+        interval = 3600.0 / per_hour if per_hour and per_hour > 0 else 0.0
+        self.interval = max(interval, float(min_delay or 0))
+        self.jitter = jitter
+        self._next = 0.0
+
+    def wait(self) -> None:
+        now = time.monotonic()
+        if self._next > now:
+            time.sleep(self._next - now)
+        self._next = time.monotonic() + self.interval * random.uniform(1.0, 1.0 + self.jitter)
+
+
+class HttpClient:
+    """One requests.Session per source. A random User-Agent is drawn from the
+    configured pool for every new client (= per source and run); it stays
+    fixed within the session because JSF/PrimeFaces sites bind the ViewState
+    to the session."""
+
+    def __init__(self, cfg: Dict[str, Any], limiter: Optional[RateLimiter] = None) -> None:
+        self.timeout = float(cfg.get("timeout", 30))
+        self.limiter = limiter or RateLimiter(0, cfg.get("min_delay_seconds", 1.0))
+        agents = [a for a in cfg.get("user_agents") or [] if a.strip()]
+        self.user_agent = random.choice(agents) if agents else f"Hydra-Radar/{__version__}"
+        retry = Retry(
+            total=int(cfg.get("retries", 4)),
+            connect=int(cfg.get("retries", 4)),
+            read=int(cfg.get("retries", 4)),
+            backoff_factor=float(cfg.get("backoff_factor", 2.0)),
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        self.session = requests.Session()
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.5",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+        })
+        log.debug("HTTP client using User-Agent: %s", self.user_agent)
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        self.limiter.wait()
+        kwargs.setdefault("timeout", self.timeout)
+        resp = self.session.request(method, url, **kwargs)
+        log.debug("%s %s -> %s (%d bytes)", method, url.split("?")[0], resp.status_code, len(resp.content))
+        return resp
+
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> requests.Response:
+        return self.request("POST", url, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# Sources
+# --------------------------------------------------------------------------
+KnownFn = Callable[[str], bool]
+
+
+class Source:
+    name = "base"
+
+    def __init__(self, cfg: Dict[str, Any], http_cfg: Dict[str, Any]) -> None:
+        self.cfg = cfg
+        self.http_cfg = http_cfg
+
+    def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
+        raise NotImplementedError
+
+    def commit(self, processed_uids: Iterable[str]) -> None:
+        """Called after a successful (non-dry) run."""
+
+
+def parse_register_line(line: str) -> Dict[str, str]:
+    """'Bayern Amtsgericht München HRB 12345' -> parts."""
+    m = re.match(rf"^(?P<state>.*?)\s*Amtsgericht\s+(?P<court>.*?)\s+(?P<rt>{REGISTER_TYPES})\s+"
+                 rf"(?P<num>\d+(?:\s+[A-Z]{{1,2}})?)\b", line or "")
+    if not m:
+        return {}
+    return {"state": m.group("state").strip(), "court": f"Amtsgericht {m.group('court').strip()}",
+            "register_type": m.group("rt"), "register_number": f"{m.group('rt')} {m.group('num')}"}
+
+
+def announcement_from_rbk(item: Dict[str, Any], source: str, url: str = "") -> Announcement:
+    """Map a record in the registerbekanntmachungen JSON schema (also produced
+    by HandelsregisterSource) to an Announcement."""
+    rid = str(item.get("id") or "").strip()
+    text = item.get("details") or item.get("original_text") or ""
+    uid = f"hrbk:{rid}" if rid else "hrbk:" + sha1(
+        str(item.get("date")), str(item.get("registernummer")), str(item.get("type")), text[:500])
+    return Announcement(
+        uid=uid,
+        source=source,
+        company_name=item.get("company_name") or "",
+        text=text,
+        published=str(item.get("date") or ""),
+        court=item.get("amtsgericht") or item.get("court") or "",
+        register_type=item.get("registerart") or "",
+        register_number=item.get("registernummer") or item.get("registernumber") or "",
+        announcement_type=item.get("type") or "",
+        seat=item.get("company_seat") or "",
+        state=item.get("state") or "",
+        url=url,
+    )
+
+
+class GitHubSnapshotSource(Source):
+    """Daily JSON snapshots of handelsregister.de 'Registerbekanntmachungen'
+    maintained at github.com/coezbek/registerbekanntmachungen. Puts zero load
+    on handelsregister.de; usually lags 1-3 days."""
+
+    name = "github_snapshots"
+
+    def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
+        http = HttpClient(self.http_cfg)
+        tmpl = self.cfg.get("url_template") or GITHUB_SNAPSHOT_TEMPLATE
+        for day in daterange(since, until):
+            url = tmpl.format(date=day.isoformat(), yyyy=f"{day.year:04d}", mm=f"{day.month:02d}",
+                              dd=f"{day.day:02d}")
+            try:
+                resp = http.get(url)
+            except requests.RequestException as exc:
+                raise SourceError(f"snapshot {day}: {exc}") from exc
+            if resp.status_code == 404:
+                log.info("[%s] no snapshot for %s yet", self.name, day)
+                continue
+            if resp.status_code != 200:
+                raise SourceError(f"snapshot {day}: HTTP {resp.status_code}")
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise SourceError(f"snapshot {day}: invalid JSON") from exc
+            items = data.get("announcements") or []
+            log.info("[%s] %s: %d announcements", self.name, day, len(items))
+            for item in items:
+                try:
+                    yield announcement_from_rbk(item, self.name, url)
+                except Exception as exc:
+                    log.warning("[%s] skipping malformed record %r: %s", self.name, item.get("id"), exc)
+
+
+class HandelsregisterSource(Source):
+    """Direct scraper for https://www.handelsregister.de/rp_web/xhtml/bekanntmachungen.xhtml
+    (JSF/PrimeFaces). The portal's terms limit automated use to 60 searches/
+    retrievals per hour; the built-in rate limiter enforces max_requests_per_hour.
+    Only the last ~8 weeks are online."""
+
+    name = "handelsregister"
+    PAGE = "https://www.handelsregister.de/rp_web/xhtml/bekanntmachungen.xhtml"
+    FORM = "bekanntMachungenForm"
+    ONCLICK_RE = re.compile(r"fireBekanntmachung\d*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)")
+    AJAX_HEADERS = {
+        "Faces-Request": "partial/ajax",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "application/xml, text/xml, */*; q=0.01",
+    }
+
+    def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
+        page = self.cfg.get("page_url") or self.PAGE
+        limiter = RateLimiter(float(self.cfg.get("max_requests_per_hour", 55)),
+                              self.http_cfg.get("min_delay_seconds", 1.0))
+        http = HttpClient(self.http_cfg, limiter)
+        max_details = int(self.cfg.get("max_details_per_run", 400))
+        earliest = dt.date.today() - dt.timedelta(days=55)
+        if since < earliest:
+            log.info("[%s] only ~8 weeks are online, clamping start to %s", self.name, earliest)
+            since = earliest
+        if since > until:
+            return
+
+        resp = http.get(page)
+        if resp.status_code != 200:
+            raise SourceError(f"search page HTTP {resp.status_code}")
+        soup = BeautifulSoup(resp.text, "lxml")
+        form = soup.find("form", id=self.FORM)
+        if form is None:
+            raise SourceError("search form not found - page layout changed?")
+        fields = self.serialize_form(form)
+        remote_id = self.find_remote_command(soup, resp.text)
+        fields[f"{self.FORM}:datum_von_input"] = since.strftime("%d.%m.%Y")
+        fields[f"{self.FORM}:datum_bis_input"] = until.strftime("%d.%m.%Y")
+        button = f"{self.FORM}:rrbSuche"
+
+        ajax = dict(fields)
+        ajax.update({"javax.faces.partial.ajax": "true", "javax.faces.source": button,
+                     "javax.faces.partial.execute": "@all", "javax.faces.partial.render": self.FORM,
+                     button: button})
+        resp = http.post(page, data=ajax, headers=self.AJAX_HEADERS)
+        result_html, view_state = self.parse_partial_response(resp.text)
+        entries = self.parse_result_list(result_html)
+        if not entries and "datalistId" not in result_html:
+            log.debug("[%s] AJAX search returned no list, retrying as full POST", self.name)
+            full = dict(fields)
+            full[button] = ""
+            resp = http.post(page, data=full)
+            result_html, view_state = resp.text, None
+            entries = self.parse_result_list(result_html)
+        if view_state is None:
+            vs = BeautifulSoup(result_html, "lxml").find("input", attrs={"name": "javax.faces.ViewState"})
+            view_state = vs.get("value") if vs else fields.get("javax.faces.ViewState", "")
+        log.info("[%s] %s..%s: %d announcements listed", self.name, since, until, len(entries))
+
+        fetched = 0
+        for entry in entries:
+            uid = f"hrbk:{entry['id']}"
+            if is_known(uid):
+                continue
+            if fetched >= max_details:
+                log.warning("[%s] max_details_per_run=%d reached, rest follows next run",
+                            self.name, max_details)
+                break
+            data = {"javax.faces.partial.ajax": "true", "javax.faces.source": remote_id,
+                    "javax.faces.partial.execute": self.FORM, "javax.faces.partial.render": self.FORM,
+                    remote_id: remote_id, "datum": entry["datum"], "id": entry["id"],
+                    self.FORM: self.FORM, "javax.faces.ViewState": view_state}
+            try:
+                detail = http.post(page, data=data, headers=self.AJAX_HEADERS)
+            except requests.RequestException as exc:
+                log.warning("[%s] detail %s failed: %s", self.name, entry["id"], exc)
+                continue
+            fetched += 1
+            text, new_vs = self.parse_detail(detail.text)
+            view_state = new_vs or view_state
+            if not text:
+                log.warning("[%s] empty detail text for %s (%s)", self.name, entry["id"], entry.get("company_name"))
+            entry["details"] = text or entry.get("original_text", "")
+            yield announcement_from_rbk(entry, self.name, page)
+
+    # -- parsing helpers (static so they are unit-testable) -----------------
+    @staticmethod
+    def serialize_form(form: Any) -> Dict[str, str]:
+        data: Dict[str, str] = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            itype = (inp.get("type") or "text").lower()
+            if not name or itype in ("submit", "button", "image", "reset", "file"):
+                continue
+            if itype in ("checkbox", "radio") and not inp.has_attr("checked"):
+                continue
+            data[name] = inp.get("value", "on" if itype in ("checkbox", "radio") else "")
+        for sel in form.find_all("select"):
+            name = sel.get("name")
+            if not name:
+                continue
+            opt = sel.find("option", selected=True) or sel.find("option")
+            data[name] = opt.get("value", opt.get_text(strip=True)) if opt else ""
+        for ta in form.find_all("textarea"):
+            if ta.get("name"):
+                data[ta["name"]] = ta.get_text()
+        return data
+
+    @classmethod
+    def find_remote_command(cls, soup: Any, raw: str) -> str:
+        for script in soup.find_all("script"):
+            if script.get("id") and "fireBekanntmachung" in (script.string or script.get_text() or ""):
+                return script["id"]
+        m = re.search(r"fireBekanntmachung\d*\s*=\s*function.*?PrimeFaces\.ab\(\s*\{\s*s\s*:\s*[\"']([^\"']+)",
+                      raw, re.DOTALL)
+        if m:
+            return m.group(1)
+        m = re.search(r"name\s*:\s*[\"']fireBekanntmachung\d*[\"'].{0,500}?\bs\s*:\s*[\"']([^\"']+)", raw, re.DOTALL)
+        if m:
+            return m.group(1)
+        log.warning("remote command id not found, falling back to %s:j_idt114", cls.FORM)
+        return f"{cls.FORM}:j_idt114"
+
+    @staticmethod
+    def parse_partial_response(body: str) -> Tuple[str, Optional[str]]:
+        if "<partial-response" not in body:
+            return body, None
+        soup = BeautifulSoup(body, "lxml-xml")
+        html_parts, view_state = [], None
+        for upd in soup.find_all("update"):
+            uid = upd.get("id", "")
+            if "ViewState" in uid:
+                view_state = upd.get_text()
+            else:
+                html_parts.append(upd.get_text())
+        return "\n".join(html_parts), view_state
+
+    @classmethod
+    def parse_result_list(cls, page_html: str) -> List[Dict[str, Any]]:
+        soup = BeautifulSoup(page_html, "lxml")
+        dl = soup.find("dl", id=re.compile(r"datalistId"))
+        if dl is None:
+            return []
+        entries: List[Dict[str, Any]] = []
+        current_date = ""
+        for node in dl.find_all(["dt", "dd"], recursive=False):
+            if node.name == "dt":
+                try:
+                    current_date = dt.datetime.strptime(node.get_text(strip=True), "%d.%m.%Y").date().isoformat()
+                except ValueError:
+                    current_date = node.get_text(strip=True)
+                continue
+            for a in node.find_all("a"):
+                m = cls.ONCLICK_RE.search(a.get("onclick", ""))
+                if not m:
+                    continue
+                lines = [ln.strip() for ln in a.get_text("\n").split("\n") if ln.strip()]
+                if lines and lines[0].strip("–- ").lower() == "gelöscht":
+                    lines = lines[1:]
+                entry: Dict[str, Any] = {"date": current_date, "datum": m.group(1), "id": m.group(2),
+                                         "original_text": "\n".join(lines),
+                                         "type": lines[0] if lines else ""}
+                reg = parse_register_line(lines[1]) if len(lines) > 1 else {}
+                entry.update({"state": reg.get("state", ""), "amtsgericht": reg.get("court", ""),
+                              "registernummer": reg.get("register_number", ""),
+                              "registerart": reg.get("register_type", "")})
+                name_line = lines[2] if len(lines) > 2 else ""
+                name, _, seat = name_line.rpartition(" – ") if " – " in name_line else (name_line, "", "")
+                entry["company_name"], entry["company_seat"] = name.strip(), seat.strip()
+                entries.append(entry)
+        return entries
+
+    @staticmethod
+    def parse_detail(body: str) -> Tuple[str, Optional[str]]:
+        content, view_state = HandelsregisterSource.parse_partial_response(body)
+        soup = BeautifulSoup(content, "lxml")
+        panel = soup.find(id=re.compile(r"(?:rrb|srb)Panel_content$"))
+        if panel is None:
+            return "", view_state
+        return normalize_text(panel.get_text("\n")), view_state
+
+
+class OpenCorporatesClient:
+    """Thin OpenCorporates API v0.4 client (API token required)."""
+
+    API = "https://api.opencorporates.com/v0.4"
+
+    def __init__(self, cfg: Dict[str, Any], http_cfg: Dict[str, Any]) -> None:
+        self.token = os.environ.get(ENV_OC_TOKEN) or cfg.get("api_token") or ""
+        if not self.token:
+            raise ConfigError("OpenCorporates enabled but no api_token (config or $%s)" % ENV_OC_TOKEN)
+        self.http = HttpClient(http_cfg, RateLimiter(float(cfg.get("max_requests_per_hour", 300)),
+                                                     http_cfg.get("min_delay_seconds", 1.0)))
+        self.max_enrich = int(cfg.get("max_enrichments_per_run", 50))
+        self.enriched = 0
+
+    def _get(self, path: str, **params: Any) -> Dict[str, Any]:
+        params["api_token"] = self.token
+        resp = self.http.get(f"{self.API}{path}", params=params, headers={"Accept": "application/json"})
+        if resp.status_code == 401:
+            raise SourceError("OpenCorporates rejected the API token (401)")
+        if resp.status_code == 403:
+            raise SourceError("OpenCorporates quota exceeded or access denied (403)")
+        if resp.status_code != 200:
+            raise SourceError(f"OpenCorporates HTTP {resp.status_code} for {path}")
+        return resp.json().get("results") or {}
+
+    def search(self, **params: Any) -> Dict[str, Any]:
+        return self._get("/companies/search", **params)
+
+    def company(self, jurisdiction: str, number: str) -> Dict[str, Any]:
+        return (self._get(f"/companies/{quote(jurisdiction)}/{quote(number, safe='')}")
+                .get("company") or {})
+
+    @staticmethod
+    def company_text(c: Dict[str, Any]) -> str:
+        lines = []
+        jur_label = {"ch": "Switzerland"}
+        for key in ("registered_address_in_full", "company_type", "current_status"):
+            if c.get(key):
+                lines.append(f"{key}: {c[key]}")
+        for prev in c.get("previous_names") or []:
+            lines.append(f"previous name: {prev.get('company_name', '')}")
+        for code in c.get("industry_codes") or []:
+            ic = code.get("industry_code") or code
+            lines.append(f"industry: {ic.get('description', '')}")
+        for rel in ("home_company", "controlling_entity", "ultimate_beneficial_owner"):
+            other = c.get(rel)
+            if isinstance(other, dict) and other:
+                jur = (other.get("jurisdiction_code") or "").lower()
+                lines.append(f"{rel}: {other.get('name', '')} (jurisdiction: {jur}"
+                             f"{' / ' + jur_label[jur] if jur in jur_label else ''})")
+        for item in c.get("officers") or []:
+            o = item.get("officer") or item
+            bits = [f"{o.get('position') or 'officer'}: {o.get('name', '')}"]
+            for k in ("nationality", "address", "occupation", "date_of_birth"):
+                if o.get(k):
+                    bits.append(f"{k}: {o[k]}")
+            if o.get("end_date"):
+                bits.append(f"until {o['end_date']}")
+            lines.append(", ".join(bits))
+        return "\n".join(lines)
+
+    def enrich(self, ann: Announcement) -> str:
+        if self.enriched >= self.max_enrich:
+            log.debug("OpenCorporates enrichment budget exhausted")
+            return ""
+        self.enriched += 1
+        number, jur = ann.meta.get("oc_number"), ann.meta.get("oc_jurisdiction", "de")
+        if not number:
+            res = self.search(q=ann.company_name, jurisdiction_code="de", per_page=10)
+            candidates = [c.get("company") or {} for c in res.get("companies") or []]
+            digits = re.sub(r"\D", "", ann.register_number)
+            pick = None
+            for c in candidates:
+                cn = c.get("company_number", "")
+                if digits and re.search(rf"(?<!\d){digits}(?!\d)", cn) and \
+                        (not ann.register_type or ann.register_type in cn):
+                    pick = c
+                    break
+            if pick is None:
+                pick = next((c for c in candidates if norm_key(c.get("name", "")) == norm_key(ann.company_name)), None)
+            if pick is None:
+                log.debug("OpenCorporates: no match for %s", ann.company_name)
+                return ""
+            number, jur = pick["company_number"], pick.get("jurisdiction_code", "de")
+        details = self.company(jur, number)
+        text = self.company_text(details)
+        log.debug("OpenCorporates enrichment for %s: %d chars", ann.company_name, len(text))
+        return text
+
+
+class OpenCorporatesSource(Source):
+    """Newly incorporated German companies via OpenCorporates search
+    (name queries + incorporation_date range). Covers 'Neueintragungen'."""
+
+    name = "opencorporates"
+
+    def __init__(self, cfg: Dict[str, Any], http_cfg: Dict[str, Any],
+                 client: Optional[OpenCorporatesClient] = None) -> None:
+        super().__init__(cfg, http_cfg)
+        self.client = client or OpenCorporatesClient(cfg, http_cfg)
+
+    def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
+        seen: set = set()
+        for query in self.cfg.get("name_queries") or ["Energie"]:
+            for page in range(1, int(self.cfg.get("max_pages", 5)) + 1):
+                res = self.client.search(q=query, jurisdiction_code="de", per_page=100, page=page,
+                                         incorporation_date=f"{since.isoformat()}:{until.isoformat()}",
+                                         order="incorporation_date")
+                companies = res.get("companies") or []
+                log.info("[%s] q=%r page %d: %d companies", self.name, query, page, len(companies))
+                for item in companies:
+                    c = item.get("company") or {}
+                    number, jur = c.get("company_number", ""), c.get("jurisdiction_code", "de")
+                    uid = f"oc:{jur}:{number}"
+                    if not number or uid in seen or is_known(uid):
+                        continue
+                    seen.add(uid)
+                    rt, num = "", ""
+                    m = re.search(rf"({REGISTER_TYPES})[\s_]?(\d+\s?[A-Z]?)", number)
+                    if m:
+                        rt, num = m.group(1), f"{m.group(1)} {m.group(2).strip()}"
+                    text = f"{c.get('name', '')}\n" + OpenCorporatesClient.company_text(c)
+                    yield Announcement(
+                        uid=uid, source=self.name, company_name=c.get("name", ""), text=text,
+                        published=c.get("incorporation_date") or "", register_type=rt,
+                        register_number=num, announcement_type="Neueintragung (OpenCorporates)",
+                        seat=c.get("registered_address_in_full") or "", url=c.get("opencorporates_url", ""),
+                        event_hint="Neueintragung", meta={"oc_number": number, "oc_jurisdiction": jur},
+                    )
+                if page >= int(res.get("total_pages") or 1):
+                    break
+
+
+class LocalInboxSource(Source):
+    """Reads announcement texts dropped into a folder (.txt, .html, .xml, .json),
+    e.g. exported register prints (CD/AD/SI) or texts from other tools."""
+
+    name = "local"
+    SUFFIXES = {".txt", ".html", ".htm", ".xml", ".json"}
+
+    def __init__(self, cfg: Dict[str, Any], http_cfg: Dict[str, Any]) -> None:
+        super().__init__(cfg, http_cfg)
+        self.inbox = Path(cfg.get("inbox_dir") or "data/inbox")
+        self.archive = Path(cfg.get("archive_dir") or self.inbox / "processed")
+        self._files: Dict[str, Path] = {}
+
+    def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
+        if not self.inbox.is_dir():
+            log.info("[%s] inbox %s does not exist", self.name, self.inbox)
+            return
+        for path in sorted(p for p in self.inbox.iterdir() if p.is_file() and p.suffix.lower() in self.SUFFIXES):
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+                anns = list(self.parse_file(path, raw))
+            except Exception as exc:
+                log.warning("[%s] cannot parse %s: %s", self.name, path.name, exc)
+                continue
+            for ann in anns:
+                self._files[ann.uid] = path
+                yield ann
+
+    def parse_file(self, path: Path, raw: str) -> Iterator[Announcement]:
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            data = json.loads(raw)
+            items = data.get("announcements") if isinstance(data, dict) and "announcements" in data else data
+            for item in items if isinstance(items, list) else [items]:
+                if not isinstance(item, dict):
+                    continue
+                if "details" in item or "registernummer" in item:
+                    ann = announcement_from_rbk(item, self.name, str(path))
+                else:
+                    text = item.get("text", "")
+                    ann = Announcement(
+                        uid=item.get("uid") or "file:" + sha1(path.name, text),
+                        source=self.name, company_name=item.get("company_name", ""), text=text,
+                        published=item.get("published", ""), court=item.get("court", ""),
+                        register_number=item.get("register_number", ""), purpose=item.get("purpose", ""),
+                        announcement_type=item.get("type", ""), url=str(path))
+                yield ann
+            return
+        if suffix in (".html", ".htm", ".xml"):
+            parser = "lxml-xml" if suffix == ".xml" else "lxml"
+            text = BeautifulSoup(raw, parser).get_text("\n")
+        else:
+            text = raw
+        text = normalize_text(text)
+        court, rtype, number = extract_register(text)
+        name = self.guess_company_name(text) or path.stem
+        yield Announcement(uid="file:" + sha1(path.name, text), source=self.name, company_name=name,
+                           text=text, court=court, register_type=rtype, register_number=number,
+                           url=str(path), published=dt.date.fromtimestamp(path.stat().st_mtime).isoformat())
+
+    @staticmethod
+    def guess_company_name(text: str) -> str:
+        legal = re.compile(r"\b(GmbH|AG|KG|SE|UG|OHG|eG|e\.K\.|GmbH & Co\. KG|mbH)\b")
+        for line in text.splitlines()[:15]:
+            line = line.strip()
+            if 3 < len(line) < 160 and legal.search(line) and "Amtsgericht" not in line:
+                return line.split(" – ")[0].strip()
+        return ""
+
+    def commit(self, processed_uids: Iterable[str]) -> None:
+        done = {self._files[u] for u in processed_uids if u in self._files}
+        if not done:
+            return
+        self.archive.mkdir(parents=True, exist_ok=True)
+        for path in done:
+            try:
+                path.rename(self.archive / path.name)
+            except OSError as exc:
+                log.warning("[%s] cannot archive %s: %s", self.name, path.name, exc)
+
+
+# --------------------------------------------------------------------------
+# Persistence
+# --------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS processed (
+    uid               TEXT PRIMARY KEY,
+    source            TEXT NOT NULL,
+    company_key       TEXT,
+    company_name      TEXT,
+    court             TEXT,
+    register_number   TEXT,
+    published         TEXT,
+    announcement_type TEXT,
+    sector_hit        INTEGER NOT NULL DEFAULT 0,
+    swiss_hit         INTEGER NOT NULL DEFAULT 0,
+    processed_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_processed_company ON processed(company_key);
+CREATE INDEX IF NOT EXISTS idx_processed_regnr ON processed(register_number);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid             TEXT NOT NULL,
+    company_key     TEXT NOT NULL,
+    name_key        TEXT NOT NULL,
+    company_name    TEXT,
+    register_number TEXT,
+    court           TEXT,
+    payload         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL,
+    sent_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_company ON alerts(company_key);
+CREATE INDEX IF NOT EXISTS idx_alerts_name ON alerts(name_key);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+"""
+
+
+class Database:
+    def __init__(self, path: Path, read_only: bool = False) -> None:
+        self.read_only = read_only
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path), timeout=30)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 30000")
+        if not read_only:
+            self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def is_processed(self, uid: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM processed WHERE uid = ?", (uid,)).fetchone() is not None
+
+    def company_alerted(self, ann: Announcement) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM alerts WHERE company_key = ? OR name_key = ? LIMIT 1",
+            (ann.company_key, ann.name_key)).fetchone()
+        return row is not None
+
+    def uid_alerted(self, uid: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM alerts WHERE uid = ?", (uid,)).fetchone() is not None
+
+    def record(self, ann: Announcement, ev: Evaluation, alert_payload: Optional[Dict[str, Any]]) -> Optional[int]:
+        """Mark announcement processed and (optionally) queue an alert atomically."""
+        if self.read_only:
+            return None
+        alert_id = None
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO processed (uid, source, company_key, company_name, court, "
+                "register_number, published, announcement_type, sector_hit, swiss_hit, processed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (ann.uid, ann.source, ann.company_key, ann.company_name, ann.court, ann.register_number,
+                 ann.published, ann.announcement_type, int(bool(ev.sector_hits)), int(bool(ev.findings)),
+                 utcnow()))
+            if alert_payload is not None:
+                cur = self.conn.execute(
+                    "INSERT INTO alerts (uid, company_key, name_key, company_name, register_number, court, "
+                    "payload, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (ann.uid, ann.company_key, ann.name_key, ann.company_name, ann.register_number, ann.court,
+                     json.dumps(alert_payload, ensure_ascii=False), utcnow()))
+                alert_id = cur.lastrowid
+        return alert_id
+
+    def pending_alerts(self) -> List[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM alerts WHERE status = 'pending' ORDER BY id"))
+
+    def mark_alert(self, alert_id: int, ok: bool, error: str = "") -> None:
+        if self.read_only:
+            return
+        with self.conn:
+            if ok:
+                self.conn.execute("UPDATE alerts SET status='sent', sent_at=?, attempts=attempts+1, "
+                                  "last_error=NULL WHERE id=?", (utcnow(), alert_id))
+            else:
+                self.conn.execute("UPDATE alerts SET attempts=attempts+1, last_error=? WHERE id=?",
+                                  (error[:500], alert_id))
+
+
+# --------------------------------------------------------------------------
+# Alerting
+# --------------------------------------------------------------------------
+def build_alert(ann: Announcement, ev: Evaluation, max_findings: int) -> Dict[str, Any]:
+    return {
+        "company_name": ann.company_name,
+        "register_number": ann.register_number,
+        "court": ann.court,
+        "register_label": ann.register_label,
+        "announcement_type": ann.announcement_type,
+        "events": ev.events,
+        "published": ann.published,
+        "seat": ann.seat,
+        "source": ann.source,
+        "url": ann.url,
+        "uid": ann.uid,
+        "sector_hits": ev.sector_hits,
+        "findings": [f.as_dict() for f in ev.findings[:max_findings]],
+        "findings_total": len(ev.findings),
+        "text": ann.text,
+        "enrichment_text": ev.enrichment_text,
+    }
+
+
+def format_alert_console(alert: Dict[str, Any]) -> str:
+    lines = [
+        "=" * 78,
+        f"ALERT  {alert['company_name']}",
+        f"  Register : {alert['register_label']}",
+        f"  Type     : {alert.get('announcement_type') or '-'}"
+        + (f"  [{', '.join(alert['events'])}]" if alert.get("events") else ""),
+        f"  Published: {alert.get('published') or '-'}   Source: {alert['source']}",
+        f"  Sector   : {', '.join(alert['sector_hits'])}",
+        "  Swiss connection:",
+    ]
+    for f in alert["findings"]:
+        lines.append(f"    - [{f['origin']}] {f['summary']}")
+        lines.append(f"        {f['context']}")
+    lines.append("  Text:")
+    lines += ["    " + ln for ln in truncate(alert["text"], 1500).splitlines()]
+    return "\n".join(lines)
+
+
+class DiscordNotifier:
+    # Discord limits: title 256, description 4096, field value 1024, total 6000
+    def __init__(self, cfg: Dict[str, Any], http_cfg: Dict[str, Any]) -> None:
+        self.url = (os.environ.get(ENV_WEBHOOK) or cfg.get("webhook_url") or "").strip()
+        self.username = cfg.get("username") or "Hydra-Radar"
+        self.mention = cfg.get("mention") or ""
+        self.max_text = min(int(cfg.get("max_text_chars", 3000)), 3500)
+        self.attach = bool(cfg.get("attach_full_text", True))
+        self.http = HttpClient({**http_cfg, "retries": 0, "user_agents": [f"Hydra-Radar/{__version__}"]},
+                               RateLimiter(0, 1.0))
+
+    @property
+    def configured(self) -> bool:
+        return bool(re.match(r"^https://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w\-]+", self.url))
+
+    def build_payload(self, alert: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+        connection_lines = []
+        for f in alert["findings"]:
+            tag = " (OpenCorporates)" if f.get("origin") == "opencorporates" else ""
+            connection_lines.append(f"• **{discord_escape(f['summary'])}**{tag}\n  ↳ {discord_escape(f['context'])}")
+        extra = alert.get("findings_total", 0) - len(alert["findings"])
+        if extra > 0:
+            connection_lines.append(f"… and {extra} more")
+        connection = truncate("\n".join(connection_lines), 1024)
+
+        text = alert["text"] or "(no text)"
+        attach = None
+        if len(text) > self.max_text and self.attach:
+            attach = text + ("\n\n--- OpenCorporates ---\n" + alert["enrichment_text"]
+                             if alert.get("enrichment_text") else "")
+        description = "```\n" + truncate(text.replace("```", "'''"), self.max_text) + "\n```"
+
+        register = alert["register_number"] or "n/a"
+        fields = [
+            {"name": "Company", "value": truncate(discord_escape(alert["company_name"]) or "n/a", 1024), "inline": True},
+            {"name": "Register no.", "value": truncate(register, 1024), "inline": True},
+            {"name": "Court", "value": truncate(alert.get("court") or "n/a", 1024), "inline": True},
+            {"name": "🇨🇭 Swiss connection", "value": connection or "n/a", "inline": False},
+            {"name": "Sector match", "value": truncate(", ".join(alert["sector_hits"]), 1024), "inline": True},
+            {"name": "Announcement",
+             "value": truncate(" / ".join(x for x in [alert.get("announcement_type") or "",
+                                                      ", ".join(alert.get("events") or [])] if x) or "n/a", 1024),
+             "inline": True},
+        ]
+        embed: Dict[str, Any] = {
+            "title": truncate(f"🚨 Swiss link: {alert['company_name']}", 256),
+            "description": description,
+            "color": 0xD52B1E,
+            "fields": fields,
+            "footer": {"text": truncate(f"Hydra-Radar {__version__} · {alert['source']} · published "
+                                        f"{alert.get('published') or '?'} · {alert['uid']}", 2048)},
+            "timestamp": utcnow(),
+        }
+        if alert.get("url", "").startswith("http"):
+            embed["url"] = alert["url"]
+        # enforce the 6000 character embed budget by shrinking the description
+        total = len(embed["title"]) + len(embed["description"]) + len(embed["footer"]["text"]) + \
+            sum(len(f["name"]) + len(f["value"]) for f in fields)
+        if total > 5900:
+            over = total - 5900
+            embed["description"] = "```\n" + truncate(text.replace("```", "'''"),
+                                                     max(200, self.max_text - over)) + "\n```"
+        payload: Dict[str, Any] = {"username": self.username, "embeds": [embed],
+                                   "allowed_mentions": {"parse": ["users", "roles", "everyone"]}}
+        if self.mention:
+            payload["content"] = self.mention
+        return payload, attach
+
+    def send(self, alert: Dict[str, Any]) -> None:
+        if not self.configured:
+            raise NotifyError("Discord webhook URL not configured")
+        payload, attachment = self.build_payload(alert)
+        url = self.url + ("&" if "?" in self.url else "?") + "wait=true"
+        for attempt in range(1, 6):
+            try:
+                if attachment:
+                    fname = re.sub(r"[^\w\-]+", "_", alert["company_name"])[:60] or "registration"
+                    resp = self.http.post(url, data={"payload_json": json.dumps(payload)},
+                                          files={"files[0]": (f"{fname}.txt", attachment.encode("utf-8"),
+                                                              "text/plain")})
+                else:
+                    resp = self.http.post(url, json=payload)
+            except requests.RequestException as exc:
+                if attempt == 5:
+                    raise NotifyError(f"network error: {exc}") from exc
+                time.sleep(2 ** attempt)
+                continue
+            if resp.status_code == 429:
+                try:
+                    wait = float(resp.json().get("retry_after", 2))
+                except ValueError:
+                    wait = 2.0
+                wait = wait / 1000 if wait > 300 else wait  # old API versions return ms
+                log.info("Discord rate limit, sleeping %.1fs", wait)
+                time.sleep(min(wait, 60) + 0.25)
+                continue
+            if resp.status_code >= 500:
+                time.sleep(2 ** attempt)
+                continue
+            if resp.ok:
+                return
+            raise NotifyError(f"Discord HTTP {resp.status_code}: {resp.text[:300]}")
+        raise NotifyError("Discord: giving up after retries")
+
+    def send_test(self) -> None:
+        alert = {
+            "company_name": "Hydra-Radar Testmeldung GmbH", "register_number": "HRB 00000",
+            "court": "Amtsgericht Musterstadt", "register_label": "HRB 00000 · Amtsgericht Musterstadt",
+            "announcement_type": "Test", "events": [], "published": dt.date.today().isoformat(),
+            "seat": "", "source": "test", "url": "", "uid": "test", "sector_hits": ["Strom"],
+            "findings": [Finding("person", "Geschäftsführer: Muster, Max (*01.01.1970) – residence: Zug / Schweiz",
+                                 "", "Geschäftsführer: «Muster, Max, Zug / Schweiz, *01.01.1970»").as_dict()],
+            "findings_total": 1, "text": "Webhook test – if you can read this, alerting works.",
+            "enrichment_text": "",
+        }
+        self.send(alert)
+
+
+# --------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------
+SOURCE_CLASSES = {
+    "github_snapshots": GitHubSnapshotSource,
+    "handelsregister": HandelsregisterSource,
+    "opencorporates": OpenCorporatesSource,
+    "local": LocalInboxSource,
+}
+
+
+def resolve_path(value: str, base: Path) -> Path:
+    p = Path(os.path.expanduser(value))
+    return p if p.is_absolute() else (base / p)
+
+
+def load_config(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        raise ConfigError(f"config file not found: {path}")
+    try:
+        user_cfg = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path}: invalid JSON ({exc})") from exc
+    cfg = deep_merge(DEFAULT_CONFIG, user_cfg)
+    base = path.resolve().parent
+    cfg["database"]["path"] = str(resolve_path(cfg["database"]["path"], base))
+    cfg["logging"]["dir"] = str(resolve_path(cfg["logging"]["dir"], base))
+    cfg["run"]["lock_file"] = str(resolve_path(cfg["run"]["lock_file"], base))
+    local = cfg["sources"].get("local") or {}
+    for key in ("inbox_dir", "archive_dir"):
+        if local.get(key):
+            local[key] = str(resolve_path(local[key], base))
+    return cfg
+
+
+def setup_logging(cfg: Dict[str, Any], verbose: bool, quiet: bool) -> None:
+    root = logging.getLogger("hydra_radar")
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+    level = getattr(logging, str(cfg["logging"].get("level", "INFO")).upper(), logging.INFO)
+    try:
+        log_dir = Path(cfg["logging"]["dir"])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(log_dir / "radar.log", maxBytes=int(cfg["logging"]["max_bytes"]),
+                                                  backupCount=int(cfg["logging"]["backups"]), encoding="utf-8")
+        fh.setLevel(logging.DEBUG if verbose else level)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except OSError as exc:
+        print(f"warning: file logging disabled: {exc}", file=sys.stderr)
+    ch = logging.StreamHandler(sys.stderr)
+    # interactive: INFO; under cron (no TTY): only warnings, so cron mail stays quiet
+    ch.setLevel(logging.DEBUG if verbose else logging.ERROR if quiet else
+                logging.INFO if sys.stderr.isatty() else logging.WARNING)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+
+class RunLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fh: Any = None
+
+    def __enter__(self) -> "RunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, "w")
+        try:
+            import fcntl
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:  # non-POSIX: no locking
+            pass
+        except OSError:
+            self.fh.close()
+            raise
+        self.fh.write(str(os.getpid()))
+        self.fh.flush()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.fh:
+            self.fh.close()
+
+
+@dataclasses.dataclass
+class Stats:
+    seen: int = 0
+    skipped: int = 0
+    evaluated: int = 0
+    sector: int = 0
+    swiss: int = 0
+    alerts_new: int = 0
+    alerts_sent: int = 0
+    alerts_failed: int = 0
+    suppressed: int = 0
+    source_errors: int = 0
+
+
+def build_sources(cfg: Dict[str, Any], only: Sequence[str]) -> List[Source]:
+    sources: List[Source] = []
+    for name, scfg in cfg["sources"].items():
+        if name not in SOURCE_CLASSES:
+            log.warning("unknown source %r in config - ignored", name)
+            continue
+        if only and name not in only:
+            continue
+        if not only and not scfg.get("enabled"):
+            continue
+        sources.append(SOURCE_CLASSES[name](scfg, cfg["http"]))
+    return sources
+
+
+def deliver(db: Database, notifier: DiscordNotifier, alert_id: int, alert: Dict[str, Any], stats: Stats) -> None:
+    try:
+        notifier.send(alert)
+    except NotifyError as exc:
+        stats.alerts_failed += 1
+        db.mark_alert(alert_id, False, str(exc))
+        log.error("alert #%d for %s NOT delivered (will retry next run): %s", alert_id, alert["company_name"], exc)
+        return
+    stats.alerts_sent += 1
+    db.mark_alert(alert_id, True)
+    log.info("alert #%d sent: %s", alert_id, alert["company_name"])
+
+
+def run(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    dry = args.dry_run
+    db = Database(Path(cfg["database"]["path"]), read_only=dry)
+    notifier = DiscordNotifier(cfg["discord"], cfg["http"])
+    if not dry and not notifier.configured:
+        raise ConfigError(f"discord.webhook_url is not a valid webhook URL (set it in config.json or ${ENV_WEBHOOK}),"
+                          " or run with --dry-run")
+    funnel = Funnel(cfg["detection"])
+    stats = Stats()
+    run_cfg = cfg["run"]
+
+    today = dt.date.today()
+    until = args.until or today
+    since = args.since or (until - dt.timedelta(days=int(args.days if args.days is not None
+                                                            else run_cfg["lookback_days"])))
+    log.info("Hydra-Radar %s run started (%s .. %s)%s", __version__, since, until, " [DRY-RUN]" if dry else "")
+
+    if not dry:
+        for row in db.pending_alerts():
+            log.info("retrying pending alert #%d (%s)", row["id"], row["company_name"])
+            deliver(db, notifier, row["id"], json.loads(row["payload"]), stats)
+
+    enricher: Optional[OpenCorporatesClient] = None
+    oc_cfg = cfg["sources"].get("opencorporates") or {}
+    if oc_cfg.get("enrich_candidates") and (oc_cfg.get("api_token") or os.environ.get(ENV_OC_TOKEN)) \
+            and not args.no_enrich:
+        enricher = OpenCorporatesClient(oc_cfg, cfg["http"])
+
+    try:
+        sources = build_sources(cfg, args.source or [])
+    except ConfigError:
+        raise
+    if not sources:
+        log.warning("no sources enabled - nothing to do")
+
+    known = (lambda uid: False) if args.reprocess else db.is_processed
+    for source in sources:
+        processed: List[str] = []
+        log.info("[%s] fetching", source.name)
+        try:
+            for ann in source.fetch(since, until, known):
+                stats.seen += 1
+                if known(ann.uid):
+                    stats.skipped += 1
+                    continue
+                stats.evaluated += 1
+                ev = funnel.evaluate(ann, enricher)
+                if ev.sector_hits:
+                    stats.sector += 1
+                    log.debug("[%s] sector hit %s %s: %s", source.name, ann.register_label,
+                              ann.company_name, ev.sector_hits)
+                alert = None
+                if ev.alert:
+                    stats.swiss += 1
+                    if run_cfg.get("require_event_match") and not ev.events:
+                        log.info("[%s] %s: Swiss link but no Neueintragung/Gegenstand event - skipped "
+                                 "(require_event_match)", source.name, ann.company_name)
+                    elif not args.reprocess and (
+                            (run_cfg.get("alert_once_per_company") and db.company_alerted(ann))
+                            or db.uid_alerted(ann.uid)):
+                        stats.suppressed += 1
+                        log.info("[%s] %s already alerted earlier - suppressed", source.name, ann.company_name)
+                    else:
+                        alert = build_alert(ann, ev, int(run_cfg.get("max_findings_per_alert", 15)))
+                if dry:
+                    if alert:
+                        stats.alerts_new += 1
+                        print(format_alert_console(alert), flush=True)
+                    continue
+                alert_id = db.record(ann, ev, alert)
+                processed.append(ann.uid)
+                if alert and alert_id:
+                    stats.alerts_new += 1
+                    log.warning("SWISS LINK: %s (%s) - %s", ann.company_name, ann.register_label,
+                                "; ".join(f.summary for f in ev.findings[:3]))
+                    deliver(db, notifier, alert_id, alert, stats)
+        except (SourceError, requests.RequestException) as exc:
+            stats.source_errors += 1
+            log.error("[%s] source failed: %s", source.name, exc)
+        except Exception:
+            stats.source_errors += 1
+            log.exception("[%s] unexpected error", source.name)
+        if not dry:
+            source.commit(processed)
+
+    log.info("run finished: seen=%d skipped(known)=%d evaluated=%d sector=%d swiss=%d new_alerts=%d "
+             "sent=%d failed=%d suppressed=%d source_errors=%d", stats.seen, stats.skipped, stats.evaluated,
+             stats.sector, stats.swiss, stats.alerts_new, stats.alerts_sent, stats.alerts_failed,
+             stats.suppressed, stats.source_errors)
+    db.close()
+    return 1 if (stats.source_errors or stats.alerts_failed) else 0
+
+
+def check_file(cfg: Dict[str, Any], path: str, enrich: bool) -> int:
+    raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    if path.lower().endswith((".html", ".htm", ".xml")):
+        raw = BeautifulSoup(raw, "lxml").get_text("\n")
+    ann = Announcement(uid="check", source="check", text=raw,
+                       company_name=LocalInboxSource.guess_company_name(normalize_text(raw)) or Path(path).stem)
+    funnel = Funnel(cfg["detection"])
+    oc_cfg = cfg["sources"].get("opencorporates") or {}
+    enricher = OpenCorporatesClient(oc_cfg, cfg["http"]) if enrich else None
+    ev = funnel.evaluate(ann, enricher)
+    print(f"Company     : {ann.company_name}\nRegister    : {ann.register_label}")
+    print(f"Step 1 sector: {'PASS ' + ', '.join(ev.sector_hits) if ev.sector_hits else 'no energy keyword'}")
+    print(f"Events      : {', '.join(ev.events) or '-'}")
+    if not ev.sector_hits:
+        swiss = funnel.swiss_findings(ann.text)
+        print(f"(Step 2 not reached; would have found {len(swiss)} Swiss signal(s))")
+    for f in ev.findings:
+        print(f"  [{f.kind}/{f.origin}] {f.summary}\n      {f.context}")
+    print("ALERT" if ev.alert else "no alert")
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Hydra-Radar: energy-sector register monitor with Swiss-link detection")
+    ap.add_argument("-c", "--config", default=str(BASE_DIR / "config.json"), help="path to config.json")
+    ap.add_argument("--dry-run", action="store_true", help="print alerts instead of sending; DB is not modified")
+    ap.add_argument("--days", type=int, help="look back N days (default: run.lookback_days)")
+    ap.add_argument("--since", type=parse_date, help="start date (YYYY-MM-DD)")
+    ap.add_argument("--until", type=parse_date, help="end date (YYYY-MM-DD, default today)")
+    ap.add_argument("--source", action="append", choices=sorted(SOURCE_CLASSES),
+                    help="only run this source (repeatable; ignores 'enabled')")
+    ap.add_argument("--reprocess", action="store_true", help="ignore the dedup DB for processed/alerted checks")
+    ap.add_argument("--no-enrich", action="store_true", help="skip OpenCorporates enrichment")
+    ap.add_argument("--test-webhook", action="store_true", help="send a test message to Discord and exit")
+    ap.add_argument("--check", metavar="FILE", help="run the detection funnel on a text/html file and exit")
+    ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    ap.add_argument("-q", "--quiet", action="store_true", help="only errors on stderr")
+    ap.add_argument("--version", action="version", version=f"Hydra-Radar {__version__}")
+    args = ap.parse_args(argv)
+
+    try:
+        cfg = load_config(Path(args.config))
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    setup_logging(cfg, args.verbose, args.quiet)
+
+    try:
+        if args.check:
+            return check_file(cfg, args.check, enrich=not args.no_enrich and bool(
+                (cfg["sources"].get("opencorporates") or {}).get("enrich_candidates")
+                and ((cfg["sources"]["opencorporates"].get("api_token")) or os.environ.get(ENV_OC_TOKEN))))
+        if args.test_webhook:
+            DiscordNotifier(cfg["discord"], cfg["http"]).send_test()
+            print("test message sent")
+            return 0
+        with RunLock(Path(cfg["run"]["lock_file"])):
+            return run(cfg, args)
+    except ConfigError as exc:
+        log.error("config error: %s", exc)
+        return 2
+    except NotifyError as exc:
+        log.error("%s", exc)
+        return 1
+    except OSError as exc:
+        if "lock" in str(exc).lower() or getattr(exc, "errno", None) in (11, 35):
+            log.error("another Hydra-Radar run is still active (lock %s)", cfg["run"]["lock_file"])
+            return 3
+        raise
+    except KeyboardInterrupt:
+        log.warning("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

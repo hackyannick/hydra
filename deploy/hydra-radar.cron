@@ -1,0 +1,14 @@
+# /etc/cron.d/hydra-radar  –  Hydra-Radar daily run
+# Fields: minute hour day-of-month month day-of-week USER command
+# radar.py holds its own lock (data/radar.lock), so overlapping runs exit with code 3.
+# Without a TTY only WARNING/ERROR lines go to stderr -> cron mails only on problems.
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=root
+HYDRA_DISCORD_WEBHOOK=
+
+# every day at 07:17 (server time)
+17 7 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
+
+# optional second pass in the evening (announcements arrive during the day)
+# 17 19 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json

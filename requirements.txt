@@ -1,0 +1,5 @@
+# Hydra-Radar – Python >= 3.9 (Debian 11/12/13)
+requests>=2.28,<3
+urllib3>=1.26,<3
+beautifulsoup4>=4.11,<5
+lxml>=4.9

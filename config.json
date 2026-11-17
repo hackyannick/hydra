@@ -1,0 +1,127 @@
+{
+  "_comment": "Hydra-Radar configuration. Keys starting with '_' are ignored. Plain terms are case-insensitive; prefix a term with 're:' to use a regular expression. Secrets can also come from the environment: HYDRA_DISCORD_WEBHOOK, OPENCORPORATES_API_TOKEN.",
+
+  "discord": {
+    "webhook_url": "https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME",
+    "username": "Hydra-Radar",
+    "mention": "",
+    "max_text_chars": 3000,
+    "attach_full_text": true
+  },
+
+  "database": { "path": "data/hydra_radar.sqlite3" },
+
+  "logging": { "dir": "data/logs", "level": "INFO", "max_bytes": 5242880, "backups": 10 },
+
+  "run": {
+    "_comment": "lookback_days: every run re-checks this many past days (snapshots arrive with delay; the DB prevents duplicates). require_event_match: only alert if text looks like a Neueintragung/Gegenstandsänderung.",
+    "lookback_days": 4,
+    "alert_once_per_company": true,
+    "require_event_match": false,
+    "max_findings_per_alert": 15,
+    "lock_file": "data/radar.lock"
+  },
+
+  "http": {
+    "timeout": 30,
+    "retries": 4,
+    "backoff_factor": 2.0,
+    "min_delay_seconds": 1.5,
+    "user_agents": [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+    ]
+  },
+
+  "sources": {
+    "github_snapshots": {
+      "_comment": "Daily JSON mirror of handelsregister.de Registerbekanntmachungen (github.com/coezbek/registerbekanntmachungen). No load on handelsregister.de, 1-3 days delay.",
+      "enabled": true,
+      "url_template": "https://raw.githubusercontent.com/coezbek/registerbekanntmachungen/main/db/{yyyy}-{mm}/registerbekanntmachungen-{date}.json"
+    },
+    "handelsregister": {
+      "_comment": "Direct scraper of handelsregister.de/rp_web/xhtml/bekanntmachungen.xhtml. Terms of use: max. 60 retrievals per hour - keep max_requests_per_hour below that.",
+      "enabled": false,
+      "max_requests_per_hour": 55,
+      "max_details_per_run": 400
+    },
+    "opencorporates": {
+      "_comment": "Needs an API token (opencorporates.com/api_accounts/new). Source = newly incorporated DE companies whose NAME matches name_queries. enrich_candidates = look up officers/home company for every company that passed Step 1 (any source).",
+      "enabled": false,
+      "api_token": "",
+      "name_queries": ["Energie", "Energy", "Strom", "Gas", "Power", "Solar", "Wind", "Wasserstoff", "Hydrogen", "Stadtwerke"],
+      "max_pages": 5,
+      "enrich_candidates": true,
+      "max_enrichments_per_run": 50,
+      "max_requests_per_hour": 300
+    },
+    "local": {
+      "_comment": "Drop .txt/.html/.xml/.json announcement texts (e.g. register prints) into inbox_dir; processed files are moved to archive_dir.",
+      "enabled": false,
+      "inbox_dir": "data/inbox",
+      "archive_dir": "data/inbox/processed"
+    }
+  },
+
+  "detection": {
+    "context_chars": 90,
+
+    "_sector_comment": "Step 1. Substring match (catches compounds like 'Ökostrom', 'Gasversorgung'). sector_exclude is blanked out first to avoid 'Gastronomie', 'Gasse', ...",
+    "sector_keywords": [
+      "Energieversorgung", "Energiebelieferung", "Strom", "Gas",
+      "Energiehandel", "Energielieferung", "Energieerzeugung", "Elektrizität"
+    ],
+    "sector_exclude": [
+      "re:(?<![a-zäöüß])gast\\w*",
+      "re:\\w*gassen?\\b",
+      "re:\\w*gäss\\w*",
+      "Pegasus", "Vegas", "Gasperi", "Stromberg",
+      "re:(?<![a-zäöüß])stromer\\b",
+      "re:(?<![a-zäöüß])stromlinie\\w*"
+    ],
+
+    "event_patterns": {
+      "Neueintragung": [
+        "Neueintragung", "Neugründung", "neu eingetragen",
+        "re:Gesellschaftsvertrag\\s+vom", "re:Satzung\\s+vom\\s+\\d"
+      ],
+      "Gegenstandsänderung": [
+        "re:Gegenstand(?:es)?\\s+(?:des\\s+Unternehmens\\s+)?(?:geändert|neu\\s+gefasst|erweitert)",
+        "re:Änderung\\s+(?:des|im)\\s+(?:Unternehmens)?[Gg]egenstand",
+        "re:Neuer\\s+(?:Unternehmens)?[Gg]egenstand",
+        "re:§\\s*2\\s*\\(?Gegenstand"
+      ]
+    },
+
+    "_swiss_comment": "Step 2. Whole-word match ('Zug' does not match 'Bezug'). Capitalised terms match in their exact case or ALL CAPS ('Thun'/'THUN', not the verb 'thun'); all-caps terms like 'CH-' only in caps. swiss_exclude is blanked out first.",
+    "swiss_keywords": [
+      "Schweiz", "Switzerland", "CH-", "Zug", "Stans", "Zürich", "Luzern", "Schwyz", "Nidwalden",
+      "Suisse", "Svizzera", "Swiss", "re:schweizerisch\\w*", "Kanton", "Eidgenossenschaft",
+      "Zurich", "Zuerich", "Lucerne", "Obwalden", "Appenzell"
+    ],
+    "swiss_cities": [
+      "Basel", "Bern", "Genf", "Genève", "Geneva", "Lausanne", "Lugano", "St. Gallen", "Winterthur",
+      "Chur", "Schaffhausen", "Biel", "Thun", "Aarau", "Olten", "Solothurn", "Fribourg",
+      "Freiburg im Üechtland", "Neuchâtel", "Sion", "Locarno", "Bellinzona", "Kreuzlingen",
+      "Frauenfeld", "Herisau", "Glarus", "Sarnen", "Stansstad", "Hergiswil", "Buochs",
+      "Baar", "Rotkreuz", "Hünenberg", "Pfäffikon", "Freienbach", "Wollerau",
+      "Küssnacht", "Einsiedeln", "Zollikon", "Küsnacht", "Kloten", "Opfikon", "Dübendorf",
+      "Wallisellen", "Schlieren", "Dietikon", "Horgen", "Thalwil", "Uster", "Kriens", "Emmen",
+      "Ebikon", "Allschwil", "Muttenz", "Pratteln", "Liestal", "Zofingen", "Wettingen"
+    ],
+    "_ambiguous_comment": "Places that also exist in Germany. They only count when another Swiss signal is within 120 characters.",
+    "swiss_ambiguous_cities": ["Cham", "Rheinfelden", "Laufenburg", "Altdorf", "Steinhausen", "Arbon"],
+    "swiss_exclude": [
+      "re:(?:Sächsische|Fränkische|Holsteinische|Märkische|Mecklenburgische|Böhmische|Ruppiner|Hersbrucker|Luxemburger|Pfälzische|Wetterauer|Hessische|Kasseler)[nrs]?\\s+Schweiz",
+      "Zug um Zug",
+      "re:Zug[\\s-]+(?:Nr|Nummer|fahrt|verkehr)\\b",
+      "re:Bern(?:hard|d|ward|t)\\b",
+      "re:Basel\\s+(?:III|IV|II)\\b"
+    ],
+    "swiss_legal_forms": ["AG", "SA", "S.A.", "GmbH", "Sàrl", "S.à r.l.", "Sagl", "Genossenschaft", "Holding"]
+  }
+}
