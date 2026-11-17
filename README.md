@@ -43,19 +43,60 @@ carries the notices that HGB §10 still requires: conversions and mergers
 (*Löschungsankündigungen*), filed documents and other notices. That is roughly
 100–200 per day nationwide.
 
-Hydra-Radar therefore has four interchangeable sources:
+Hydra-Radar therefore has five interchangeable sources:
 
 | Source | Covers | Cost / limits | Default |
 |---|---|---|---|
+| `register_search` | **New energy companies (Neueintragungen and renamings)**, found free via the official *Erweiterte Suche* of handelsregister.de (details below) | free; terms of use: **max. 60 retrievals/hour**, enforced by the built-in limiter | **on** |
 | `github_snapshots` | All handelsregister.de *Registerbekanntmachungen*, from the daily JSON mirror at [coezbek/registerbekanntmachungen](https://github.com/coezbek/registerbekanntmachungen) | free, no load on handelsregister.de, 1–3 days delay | **on** |
-| `handelsregister` | Same data, scraped directly from `handelsregister.de/rp_web/xhtml/bekanntmachungen.xhtml` (JSF/PrimeFaces, no browser needed) | Terms of use: **max. 60 retrievals/hour**, enforced by the built-in limiter; ~8 weeks online | off |
-| `opencorporates` | **Neueintragungen**: German companies incorporated in the date window whose *name* matches `name_queries`. Can also enrich every Step-1 candidate with officers, nationality, address and parent company | API token required (free for some uses, paid otherwise) | off |
-| `local` | Any `.txt/.html/.xml/.json` you drop into `data/inbox/`, e.g. register prints (AD/CD/SI) from handelsregister.de or exports from a commercial provider | — | off |
+| `handelsregister` | Same announcements, scraped directly from handelsregister.de (JSF/PrimeFaces, no browser needed) | free, max. 60 retrievals/hour; ~8 weeks online | off |
+| `opencorporates` | New incorporations by name, plus officer enrichment | API token, ~225 €/month | off |
+| `local` | Any `.txt/.html/.xml/.json` you drop into `data/inbox/`, e.g. register prints (AD/CD/SI) or exports from a commercial provider | — | off |
 
-To monitor *Neueintragungen* and *Gegenstandsänderungen* reliably at scale,
-enable `opencorporates` or feed a commercial register-data API into
-`data/inbox/` (JSON format below). `run.require_event_match: true` restricts
-alerts to texts that look like a new registration or a change of purpose.
+`run.require_event_match: true` restricts alerts to texts that look like a new
+registration or a change of purpose.
+
+### `register_search`: free detection of new energy companies
+
+The *Erweiterte Suche* on handelsregister.de has no "registered since"
+filter. Its limits (checked against the live portal, Nov 2026):
+
+* at most 100 hits per search, sorted alphabetically
+* at most 5 keywords per search
+* register numbers can only be searched exactly
+
+Hydra-Radar therefore works like this:
+
+1. **Daily searches.** Each keyword in `keywords` (*Energiehandel,
+   Stromvertrieb, Gasversorgung …*) is searched for each register type (HRB,
+   HRA). A keyword also matches inside compounds, for example *BürgerEnergie*.
+2. **Automatic partitioning.** If a search exceeds 100 hits, Hydra splits it
+   by federal state and, if needed, by register court. The learned split is
+   saved, so later runs go straight to the right level. Measured counts: HRB
+   *Energiehandel* 38, *Energievertrieb* 6, *Gashandel* 4, *Stromhandel* 3;
+   *Energieversorgung* is split by state.
+3. **Diff.** Every register number not seen before is a **new registration or
+   a renaming into an energy name**. The first scan of each query only stores
+   a baseline and sends no alerts.
+4. **Documents.** For each new company Hydra downloads the current register
+   print (**AD**, PDF, read with `pypdf`) or the structured content (**SI**,
+   XJustiz XML). These contain the business purpose, seat and managing
+   directors with place of residence. The text then goes through the normal
+   funnel (energy filter, then Swiss detection).
+5. **Retries.** The portal serves no documents at night (*"Der Abruf für
+   dieses Dokument ist zur Zeit nicht möglich"*, error A 450). Candidates stay
+   pending and are retried on the next run. After `max_document_attempts` runs
+   without a document, Hydra checks the name and seat only. **So run the cron
+   job during the day.**
+
+Load: every HTTP request (navigation, search, document) counts against
+`max_requests_per_hour` (default 50). A daily run with the 14 default keywords
+needs roughly 60–150 requests, so 1–3 hours. The first run builds the
+baseline and takes longer.
+
+Limits: only companies whose **name** contains one of the keywords are found.
+OpenCorporates has the same limit. A change of business purpose in a company
+without an energy name cannot be detected with free data.
 
 ## Detection details
 
@@ -175,14 +216,14 @@ python3 -m venv /opt/hydra-radar/venv
 
 ```cron
 MAILTO=root
-17 7 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
+17 10 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
 ```
 
 If you prefer a user crontab (`crontab -e` as user `hydra`), drop the user
 field:
 
 ```cron
-17 7 * * * cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
+17 10 * * * cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
 ```
 
 Notes:

@@ -49,6 +49,21 @@
       "max_requests_per_hour": 55,
       "max_details_per_run": 400
     },
+    "register_search": {
+      "_comment": "FREE detection of new energy companies via the official handelsregister.de 'Erweiterte Suche'. Each keyword x register type is searched daily (auto-split by federal state/court below the portal's 100-hit limit); every register number not seen before is a new registration or a renaming. Its current print (AD, PDF) or structured content (SI, XML) is downloaded and checked for Swiss links. The first scan only stores a baseline. Portal terms: max. 60 retrievals/hour - every HTTP request counts against max_requests_per_hour.",
+      "enabled": true,
+      "keywords": [
+        "Energiehandel", "Energievertrieb", "Energieversorgung", "Energiebelieferung", "Energielieferung",
+        "Stromhandel", "Stromvertrieb", "Stromversorgung", "Stromlieferung",
+        "Gashandel", "Gasvertrieb", "Gasversorgung", "Energy Trading", "Power Trading"
+      ],
+      "register_types": ["HRB", "HRA"],
+      "documents": ["AD", "SI"],
+      "max_requests_per_hour": 50,
+      "max_documents_per_run": 25,
+      "max_document_attempts": 6,
+      "alert_on_first_run": false
+    },
     "opencorporates": {
       "_comment": "Needs an API token (opencorporates.com/api_accounts/new). Source = newly incorporated DE companies whose NAME matches name_queries. enrich_candidates = look up officers/home company for every company that passed Step 1 (any source).",
       "enabled": false,

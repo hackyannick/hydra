@@ -318,6 +318,190 @@ class HandelsregisterParsing(unittest.TestCase):
         self.assertTrue(text.startswith("13.11.2026"))
 
 
+def minimal_pdf(lines):
+    """Tiny valid PDF with one page of text (for pdf_to_text)."""
+    content = "BT /F1 10 Tf 40 800 Td 12 TL " + " ".join(
+        "(" + ln.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") + ") '" for ln in lines) + " ET"
+    content_b = content.encode("latin-1")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R >> >> >>",
+            b"<< /Length " + str(len(content_b)).encode() + b" >>\nstream\n" + content_b + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"]
+    out, offsets = b"%PDF-1.4\n", []
+    for i, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + o + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs)+1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets)
+    out += f"trailer\n<< /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()
+    return out
+
+
+class RegisterPortalParsing(unittest.TestCase):
+    """Fixtures are trimmed real responses of www.handelsregister.de (Nov 2026)."""
+
+    def test_results_and_limit(self):
+        hits, too_many, error = radar.RegisterPortal.parse_results(
+            (FIX / "portal_results_too_many.html").read_text(encoding="utf-8"))
+        self.assertTrue(too_many)
+        self.assertEqual(len(hits), 3)
+        h = hits[0]
+        self.assertEqual((h.land, h.court, h.register_number), ("Baden-Württemberg", "Amtsgericht Stuttgart", "GnR 720333"))
+        self.assertEqual(h.name, "3-Täler-BürgerEnergie Sulz am Neckar eG")
+        self.assertEqual(h.seat, "Sulz am Neckar")
+        self.assertIn("AD", h.documents)
+        self.assertIn("SI", h.documents)
+        self.assertTrue(h.company_key.startswith("reg|stuttgart|gnr720333"))
+
+    def test_error_message_and_courts(self):
+        page = (FIX / "portal_error_regnr.html").read_text(encoding="utf-8")
+        hits, too_many, error = radar.RegisterPortal.parse_results(page)
+        self.assertEqual(hits, [])
+        self.assertFalse(too_many)
+        self.assertIn("Registernummer ist fehlerhaft", error)
+        p = radar.RegisterPortal(None)
+        p.page, p.on_form = page, False
+        sel = radar.BeautifulSoup(page, "lxml").find("select", attrs={"name": "form:registergericht_input"})
+        p.courts = {o.get_text(strip=True): o.get("value") for o in sel.find_all("option") if o.get("value")}
+        self.assertEqual(p.court_code("Amtsgericht München"), "D2601")
+        bavaria = p.courts_of("Bayern")
+        self.assertEqual(len(bavaria), 23)
+        self.assertEqual(len(p.courts_of("Berlin")), 1)
+
+    def test_document_unavailable_page(self):
+        txt = radar.BeautifulSoup((FIX / "portal_document_unavailable.html").read_text(encoding="utf-8"),
+                                  "lxml").get_text(" ", strip=True)
+        self.assertIn(radar.RegisterPortal.UNAVAILABLE, txt)
+
+    def test_pdf_and_xjustiz_text(self):
+        pdf = minimal_pdf(["Amtsgericht München HRB 299999", "Geschäftsführer:",
+                           "Keller, Urs, Baar / Schweiz, *14.02.1971"])
+        text = radar.pdf_to_text(pdf)
+        self.assertIn("Keller, Urs, Baar / Schweiz, *14.02.1971", text)
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<tns:nachricht xmlns:tns="http://www.xjustiz.de"><tns:beteiligung><tns:beteiligter>
+<tns:natuerlichePerson><tns:vollerName><tns:vorname>Urs</tns:vorname><tns:nachname>Keller</tns:nachname></tns:vollerName>
+<tns:geburt><tns:geburtsdatum>1971-02-14</tns:geburtsdatum></tns:geburt>
+<tns:anschrift><tns:ort>Baar</tns:ort><tns:staat><tns:code>Schweiz</tns:code></tns:staat></tns:anschrift>
+</tns:natuerlichePerson></tns:beteiligter></tns:beteiligung>
+<tns:gegenstand>Handel mit Strom und Gas</tns:gegenstand></tns:nachricht>""".encode()
+        text = radar.xjustiz_to_text(xml)
+        self.assertIn("Keller, Urs, Baar / Schweiz, *14.02.1971", text)
+        res = funnel().swiss_findings(text)
+        self.assertTrue(any(f.kind == "person" and "Keller, Urs" in f.summary for f in res))
+
+
+class FakePortal(radar.RegisterPortal):
+    """Simulates the portal: results per (keyword, rtype, land, court)."""
+
+    def __init__(self, table, docs=None):
+        super().__init__(None)
+        self.table, self.docs, self.calls = table, docs or {}, []
+        self.courts = {"München": "D2601", "Augsburg": "D1101", "Berlin (Charlottenburg)": "F1103"}
+
+    def open(self):
+        self.on_form = True
+
+    def to_search_form(self):
+        self.on_form = True
+
+    def search(self, keywords="", option="1", register_type="", register_number="", court_code="", land=""):
+        self.calls.append((keywords, register_type, register_number, court_code, land))
+        if register_number:
+            hit = next((h for rows in self.table.values() if isinstance(rows, list) for h in rows
+                        if h.register_number.endswith(register_number)), None)
+            return ([hit] if hit else []), False, ""
+        res = self.table.get((keywords, register_type, land, court_code), [])
+        if res == "too_many":
+            return [], True, ""
+        return res, False, ""
+
+    def download(self, hit, kind):
+        if kind not in self.docs.get(hit.register_number, {}):
+            raise radar.DocumentUnavailable("portal: document currently not available (A 450)")
+        return self.docs[hit.register_number][kind], "application/pdf"
+
+
+def hit(num, name, court="Amtsgericht München", land="Bayern"):
+    return radar.PortalHit("0", land, court, "HRB", f"HRB {num}", name, "München", "aktuell", {"AD": "x", "SI": "y"})
+
+
+class RegisterSearchFlow(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = radar.Database(self.tmp / "db.sqlite3")
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.tmp)
+
+    def source(self, portal, **cfg):
+        base = {"keywords": ["Energiehandel"], "register_types": ["HRB"], "documents": ["AD", "SI"],
+                "max_documents_per_run": 10, "max_document_attempts": 3}
+        base.update(cfg)
+        src = radar.RegisterSearchSource(base, CFG["http"])
+        src.make_portal = lambda: portal
+        src.attach_db(self.db, False)
+        return src
+
+    def run_source(self, src):
+        anns = list(src.fetch(dt.date.today(), dt.date.today(), lambda u: False))
+        src.commit([a.uid for a in anns])
+        return anns
+
+    def test_baseline_then_new_company_with_document(self):
+        old = [hit(100, "Alt Energiehandel GmbH")]
+        portal = FakePortal({("Energiehandel", "HRB", "", ""): old})
+        self.assertEqual(self.run_source(self.source(portal)), [])  # baseline only
+        self.assertTrue(self.db.search_baselined("Energiehandel|HRB"))
+        new = hit(299999, "Alpen Energiehandel GmbH")
+        portal.table[("Energiehandel", "HRB", "", "")] = old + [new]
+        portal.docs = {"HRB 299999": {"AD": minimal_pdf(["Geschäftsführer:", "Keller, Urs, Baar / Schweiz, *14.02.1971"])}}
+        anns = self.run_source(self.source(portal))
+        self.assertEqual(len(anns), 1)
+        a = anns[0]
+        self.assertEqual((a.uid, a.register_number, a.court), ("hrs:" + new.company_key, "HRB 299999", "Amtsgericht München"))
+        ev = funnel().evaluate(a)
+        self.assertTrue(ev.alert)
+        self.assertIn("Keller, Urs", ev.findings[0].summary)
+        self.assertEqual(self.run_source(self.source(portal)), [])  # done, not again
+
+    def test_auto_partition_and_plan_cache(self):
+        portal = FakePortal({("Energieversorgung", "HRB", "", ""): "too_many",
+                             ("Energieversorgung", "HRB", "Bayern", ""): "too_many",
+                             ("Energieversorgung", "HRB", "", "D2601"): [hit(1, "EV München GmbH")],
+                             ("Energieversorgung", "HRB", "Berlin", ""): [hit(2, "EV Berlin GmbH", "Amtsgericht Berlin (Charlottenburg)", "Berlin")]})
+        self.run_source(self.source(portal, keywords=["Energieversorgung"]))
+        plan = self.db.search_plan("Energieversorgung|HRB")
+        self.assertIn(["court", "D2601"], plan)
+        self.assertIn(["land", "Berlin"], plan)
+        self.assertNotIn(["all", ""], plan)
+        self.assertTrue(self.db.register_seen(hit(1, "x").company_key))
+        portal.calls.clear()
+        self.run_source(self.source(portal, keywords=["Energieversorgung"]))
+        self.assertNotIn(("Energieversorgung", "HRB", "", "", ""), portal.calls)  # cached plan used
+
+    def test_document_retry_then_give_up(self):
+        portal = FakePortal({("Energiehandel", "HRB", "", ""): []})
+        self.run_source(self.source(portal))
+        portal.table[("Energiehandel", "HRB", "", "")] = [hit(5, "Neu Energiehandel GmbH")]
+        self.assertEqual(self.run_source(self.source(portal)), [])   # attempt 1: A 450
+        self.assertEqual(self.run_source(self.source(portal)), [])   # attempt 2
+        anns = self.run_source(self.source(portal))                   # attempt 3: give up, name only
+        self.assertEqual(len(anns), 1)
+        self.assertIn("Neu Energiehandel GmbH", anns[0].text)
+
+    def test_dry_run_writes_nothing(self):
+        portal = FakePortal({("Energiehandel", "HRB", "", ""): [hit(7, "X Energiehandel GmbH")]})
+        src = self.source(portal)
+        src.attach_db(self.db, True)
+        self.assertEqual(list(src.fetch(dt.date.today(), dt.date.today(), lambda u: False)), [])
+        self.assertIsNone(self.db.search_plan("Energiehandel|HRB"))
+
+
 class _Hook(BaseHTTPRequestHandler):
     requests: list = []
     fail_first_with_429 = False
@@ -410,7 +594,7 @@ class EndToEnd(unittest.TestCase):
         self.cfg = radar.deep_merge(CFG, {
             "database": {"path": str(self.tmp / "db.sqlite3")},
             "run": {"lock_file": str(self.tmp / "lock")},
-            "sources": {"github_snapshots": {"enabled": False},
+            "sources": {"github_snapshots": {"enabled": False}, "register_search": {"enabled": False},
                         "local": {"enabled": True, "inbox_dir": str(inbox), "archive_dir": str(inbox / "done")},
                         "opencorporates": {"enabled": False, "enrich_candidates": False}},
             "http": {"min_delay_seconds": 0},

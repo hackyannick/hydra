@@ -7,8 +7,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 MAILTO=root
 HYDRA_DISCORD_WEBHOOK=
 
-# every day at 07:17 (server time)
-17 7 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
+# every day at 10:17 (server time) - during the day, because handelsregister.de
+# serves no documents at night (register_search retries pending candidates)
+17 10 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json
 
 # optional second pass in the evening (announcements arrive during the day)
 # 17 19 * * *  hydra  cd /opt/hydra-radar && ./venv/bin/python radar.py --config config.json

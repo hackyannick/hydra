@@ -77,6 +77,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "sources": {
         "github_snapshots": {"enabled": True, "url_template": ""},
         "handelsregister": {"enabled": False},
+        "register_search": {"enabled": False},
         "opencorporates": {"enabled": False},
         "local": {"enabled": False},
     },
@@ -816,6 +817,9 @@ class Source:
     def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
         raise NotImplementedError
 
+    def attach_db(self, db: "Database", dry: bool) -> None:
+        """Sources that keep their own state get the database here."""
+
     def commit(self, processed_uids: Iterable[str]) -> None:
         """Called after a successful (non-dry) run."""
 
@@ -919,12 +923,25 @@ class HandelsregisterSource(Source):
             return
 
         resp = http.get(page)
-        if resp.status_code != 200:
-            raise SourceError(f"search page HTTP {resp.status_code}")
         soup = BeautifulSoup(resp.text, "lxml")
-        form = soup.find("form", id=self.FORM)
+        form = soup.find("form", id=self.FORM) if resp.status_code == 200 else None
         if form is None:
-            raise SourceError("search form not found - page layout changed?")
+            # the portal rejects deep links (HTTP 400) - navigate like a browser
+            log.debug("[%s] direct URL refused (HTTP %s), navigating via start page", self.name, resp.status_code)
+            start = http.get(RegisterPortal.BASE + "/rp_web/welcome.xhtml")
+            navi = BeautifulSoup(start.text, "lxml").find("form", id="naviForm")
+            if navi is None:
+                raise SourceError("navigation form not found - portal layout changed?")
+            data = RegisterPortal._hidden(navi)
+            data.update({"naviForm:bekanntmachungenLink": "naviForm:bekanntmachungenLink",
+                         "target": "bekanntmachungenLink"})
+            resp = http.post(RegisterPortal.BASE + navi["action"], data=data)
+            soup = BeautifulSoup(resp.text, "lxml")
+            form = soup.find("form", id=self.FORM)
+            if form is None:
+                raise SourceError("announcement search form not found - page layout changed?")
+        if form.get("action"):
+            page = RegisterPortal.BASE + form["action"]
         fields = self.serialize_form(form)
         remote_id = self.find_remote_command(soup, resp.text)
         fields[f"{self.FORM}:datum_von_input"] = since.strftime("%d.%m.%Y")
@@ -1287,6 +1304,375 @@ class LocalInboxSource(Source):
                 log.warning("[%s] cannot archive %s: %s", self.name, path.name, exc)
 
 
+class DocumentUnavailable(Exception):
+    pass
+
+
+LAENDER = ["Baden-Württemberg", "Bayern", "Berlin", "Brandenburg", "Bremen", "Hamburg", "Hessen",
+           "Mecklenburg-Vorpommern", "Niedersachsen", "Nordrhein-Westfalen", "Rheinland-Pfalz", "Saarland",
+           "Sachsen", "Sachsen-Anhalt", "Schleswig-Holstein", "Thüringen"]
+# first letter of the portal's court code -> federal state
+COURT_PREFIX_LAND = {"B": "Baden-Württemberg", "D": "Bayern", "F": "Berlin", "G": "Brandenburg", "H": "Bremen",
+                     "K": "Hamburg", "M": "Hessen", "N": "Mecklenburg-Vorpommern", "P": "Niedersachsen",
+                     "R": "Nordrhein-Westfalen", "T": "Rheinland-Pfalz", "U": "Sachsen", "V": "Saarland",
+                     "W": "Sachsen-Anhalt", "X": "Schleswig-Holstein", "Y": "Thüringen"}
+
+
+@dataclasses.dataclass
+class PortalHit:
+    index: str
+    land: str
+    court: str
+    register_type: str
+    register_number: str
+    name: str
+    seat: str
+    status: str
+    documents: Dict[str, str]
+
+    @property
+    def company_key(self) -> str:
+        return f"reg|{norm_key(re.sub(r'(?i)amtsgericht', '', self.court))}|{norm_key(self.register_number)}"
+
+
+class RegisterPortal:
+    """Client for the 'Erweiterte Suche' of www.handelsregister.de (JSF/PrimeFaces).
+
+    Verified against the live portal (Nov 2026): max. 100 hits per search (sorted
+    alphabetically, then an error), max. 5 keywords, register numbers only exact,
+    'mindestens ein Schlagwort' needs a register type/court/state. Documents
+    (AD = current print as PDF, SI = structured content as XML) are not available
+    at night (error A 450)."""
+
+    BASE = "https://www.handelsregister.de"
+    UNAVAILABLE = "Der Abruf für dieses Dokument ist zur Zeit nicht möglich"
+
+    def __init__(self, http: HttpClient) -> None:
+        self.http = http
+        self.page = ""          # current HTML page
+        self.on_form = False
+        self.courts: Dict[str, str] = {}   # "München" -> "D2601"
+
+    # -- navigation ----------------------------------------------------------
+    @staticmethod
+    def _hidden(form: Any) -> Dict[str, str]:
+        return {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")
+                and (i.get("type") or "").lower() in ("hidden", "")}
+
+    def _post_form(self, form: Any, extra: Dict[str, str], **kw: Any) -> requests.Response:
+        data = self._hidden(form)
+        data.update(extra)
+        resp = self.http.post(self.BASE + form["action"], data=data, **kw)
+        if resp.status_code != 200:
+            raise SourceError(f"handelsregister.de HTTP {resp.status_code}")
+        return resp
+
+    def open(self) -> None:
+        resp = self.http.get(self.BASE + "/rp_web/welcome.xhtml")
+        if resp.status_code != 200:
+            raise SourceError(f"handelsregister.de start page HTTP {resp.status_code}")
+        self.page, self.on_form = resp.text, False
+        self.to_search_form()
+
+    def to_search_form(self) -> None:
+        if self.on_form:
+            return
+        soup = BeautifulSoup(self.page, "lxml")
+        navi = soup.find("form", id="naviForm")
+        if navi is None:
+            raise SourceError("navigation form not found - portal layout changed?")
+        link = "naviForm:erweiterteSucheLink"
+        resp = self._post_form(navi, {link: link, "target": "erweiterteSucheLink"})
+        soup = BeautifulSoup(resp.text, "lxml")
+        if soup.find("form", id="form") is None:
+            raise SourceError("search form not found - portal layout changed?")
+        self.page, self.on_form = resp.text, True
+        sel = soup.find("select", attrs={"name": "form:registergericht_input"})
+        if sel is not None:
+            self.courts = {o.get_text(strip=True): o.get("value") for o in sel.find_all("option") if o.get("value")}
+
+    def court_code(self, court: str) -> str:
+        name = re.sub(r"(?i)^amtsgericht\s+", "", court).strip()
+        return self.courts.get(name, "")
+
+    def courts_of(self, land: str) -> List[Tuple[str, str]]:
+        return sorted((n, c) for n, c in self.courts.items() if COURT_PREFIX_LAND.get(c[:1]) == land)
+
+    # -- search ----------------------------------------------------------------
+    def search(self, keywords: str = "", option: str = "1", register_type: str = "", register_number: str = "",
+               court_code: str = "", land: str = "") -> Tuple[List[PortalHit], bool, str]:
+        self.to_search_form()
+        form = BeautifulSoup(self.page, "lxml").find("form", id="form")
+        data = {
+            "form:schlagwoerter": keywords, "form:schlagwortOptionen": option, "form:NiederlassungSitz": "",
+            "form:registerArt_input": register_type, "form:registerNummer": register_number,
+            "form:registergericht_input": court_code, "form:rechtsform_input": "", "form:staat_input": "",
+            "form:postleitzahl": "", "form:ort": "", "form:strasse": "",
+            "form:ergebnisseProSeite_input": "100", "form:btnSuche": "",
+        }
+        if land:
+            data[f"form:{land}_input"] = "on"
+        resp = self._post_form(form, data)
+        hits, too_many, error = self.parse_results(resp.text)
+        soup = BeautifulSoup(resp.text, "lxml")
+        self.page = resp.text
+        self.on_form = soup.find("form", id="ergebnissForm") is None and soup.find("form", id="form") is not None
+        return hits, too_many, error
+
+    @staticmethod
+    def parse_results(page: str) -> Tuple[List[PortalHit], bool, str]:
+        soup = BeautifulSoup(page, "lxml")
+        text = soup.get_text(" ", strip=True)
+        too_many = "maximale Trefferanzahl" in text
+        errors = [m.get_text(" ", strip=True) for m in soup.select(".ui-messages-error-summary, .ui-messages-error")]
+        error = next((e for e in errors if e and "Trefferanzahl" not in e), "")
+        hits: List[PortalHit] = []
+        body = soup.find(id="ergebnissForm:selectedSuchErgebnisFormTable_data")
+        for row in body.find_all("tr", recursive=False) if body else []:
+            trs = row.find_all("tr")
+            if len(trs) < 2:
+                continue
+            head = " ".join(c.get_text(" ", strip=True) for c in trs[0].find_all("td"))
+            main = trs[1].find_all("td")
+            if len(main) < 3:
+                continue
+            m = re.match(rf"^(?P<land>.*?)\s*(?P<court>Amtsgericht\s+.*?)\s+(?P<rt>{REGISTER_TYPES})\s+"
+                         rf"(?P<num>\d+(?:\s+[A-Z]{{1,2}})?)\b", head)
+            if not m:
+                continue
+            docs = {}
+            for a in trs[1].find_all("a"):
+                label = a.get_text(strip=True)
+                if label in ("AD", "CD", "HD", "DK", "UT", "VÖ", "SI") and a.get("id"):
+                    docs[label] = a["id"]
+            hits.append(PortalHit(
+                index=row.get("data-ri", ""), land=m.group("land").strip(), court=m.group("court").strip(),
+                register_type=m.group("rt"), register_number=f"{m.group('rt')} {m.group('num').strip()}",
+                name=main[0].get_text(" ", strip=True), seat=main[1].get_text(" ", strip=True),
+                status=main[2].get_text(" ", strip=True), documents=docs))
+        return hits, too_many, error
+
+    # -- documents -------------------------------------------------------------
+    def download(self, hit: PortalHit, kind: str) -> Tuple[bytes, str]:
+        link = hit.documents.get(kind)
+        if not link:
+            raise DocumentUnavailable(f"no {kind} link")
+        form = BeautifulSoup(self.page, "lxml").find("form", id="ergebnissForm")
+        if form is None:
+            raise SourceError("result form missing for document download")
+        resp = self._post_form(form, {link: link}, timeout=(20, 200))
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "html" in ctype:
+            txt = BeautifulSoup(resp.text, "lxml").get_text(" ", strip=True)
+            # the error page replaces the result page; navigate fresh next time
+            self.page, self.on_form = resp.text, False
+            if self.UNAVAILABLE in txt:
+                raise DocumentUnavailable("portal: document currently not available (A 450)")
+            raise DocumentUnavailable("portal returned an HTML page instead of the document")
+        return resp.content, ctype
+
+
+def pdf_to_text(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader  # optional dependency
+    except ImportError as exc:
+        raise DocumentUnavailable("pypdf not installed - cannot read AD (PDF)") from exc
+    import io
+    reader = PdfReader(io.BytesIO(data))
+    return normalize_text("\n".join(page.extract_text() or "" for page in reader.pages))
+
+
+def xjustiz_to_text(data: bytes) -> str:
+    """Structured register content (SI, XJustiz XML) -> text. Natural persons are
+    rendered register-style ('Nachname, Vorname, Ort / Staat, *TT.MM.JJJJ') so the
+    person detector can read them; the full text follows."""
+    soup = BeautifulSoup(data, "lxml-xml")
+
+    def local(tag: Any) -> str:
+        return (tag.name or "").split(":")[-1].lower()
+
+    def first(node: Any, *names: str) -> str:
+        for el in node.find_all(True):
+            if local(el) in names:
+                t = el.get_text(" ", strip=True)
+                if t:
+                    return t
+        return ""
+
+    lines, seen = [], set()
+    for node in soup.find_all(True):
+        children = {local(c) for c in node.find_all(True, recursive=False)}
+        if not ({"vorname", "nachname", "familienname"} & {local(c) for c in node.find_all(True)}):
+            continue
+        if not children & {"vorname", "nachname", "familienname", "name", "allgemeinername"} and \
+                not any(local(c) in ("natuerlicheperson", "name") for c in node.find_all(True, recursive=False)):
+            continue
+        last = first(node, "nachname", "familienname")
+        given = first(node, "vorname")
+        if not last or (last, given) in seen:
+            continue
+        seen.add((last, given))
+        place = first(node, "wohnort", "ort")
+        state = first(node, "staat", "land", "staatsangehoerigkeit")
+        dob = first(node, "geburtsdatum")
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", dob)
+        dob = f"{m.group(3)}.{m.group(2)}.{m.group(1)}" if m else dob
+        bits = [last, given] + ([f"{place} / {state}" if state and state.lower() not in ("deutschland", "de")
+                                 else place] if place else []) + ([f"*{dob}"] if dob else [])
+        lines.append(", ".join(b for b in bits if b) + ";")
+    full = soup.get_text("\n", strip=True)
+    return normalize_text(("Beteiligte:\n" + "\n".join(lines) + "\n\n" if lines else "") + full)
+
+
+class RegisterSearchSource(Source):
+    """Free detection of new energy companies via handelsregister.de 'Erweiterte
+    Suche': daily keyword searches (auto-partitioned below the 100-hit limit),
+    every register number not seen before becomes a candidate, its current print
+    (AD) or structured content (SI) is downloaded and run through the funnel.
+    Finds new registrations AND renamings into an energy name. The first scan of
+    a query only builds the baseline (no alerts)."""
+
+    name = "register_search"
+
+    def __init__(self, cfg: Dict[str, Any], http_cfg: Dict[str, Any]) -> None:
+        super().__init__(cfg, http_cfg)
+        self.db: Optional["Database"] = None
+        self.dry = False
+        self._done: Dict[str, str] = {}
+
+    def attach_db(self, db: "Database", dry: bool) -> None:
+        self.db, self.dry = db, dry
+
+    def fetch(self, since: dt.date, until: dt.date, is_known: KnownFn) -> Iterator[Announcement]:
+        if self.db is None:
+            raise SourceError("register_search needs the database")
+        portal = self.make_portal()
+        portal.open()
+        for keyword in self.cfg.get("keywords") or []:
+            for rtype in self.cfg.get("register_types") or ["HRB", "HRA"]:
+                try:
+                    self._scan(portal, keyword, rtype)
+                except (SourceError, requests.RequestException) as exc:
+                    log.warning("[%s] search %r/%s failed: %s", self.name, keyword, rtype, exc)
+                    portal.on_form = False
+        yield from self._resolve_candidates(portal)
+
+    def make_portal(self) -> RegisterPortal:
+        limiter = RateLimiter(float(self.cfg.get("max_requests_per_hour", 50)),
+                              max(2.0, float(self.http_cfg.get("min_delay_seconds", 1.5))))
+        return RegisterPortal(HttpClient(self.http_cfg, limiter))
+
+    # -- phase 1: searches -------------------------------------------------------
+    def _scan(self, portal: RegisterPortal, keyword: str, rtype: str) -> None:
+        key = f"{keyword}|{rtype}"
+        plan = self.db.search_plan(key) or [["all", ""]]
+        leaves: List[List[str]] = []
+        hits: List[PortalHit] = []
+        queue = list(plan)
+        complete = True
+        while queue:
+            level, value = queue.pop(0)
+            kwargs: Dict[str, str] = {"keywords": keyword, "register_type": rtype}
+            if level == "land":
+                kwargs["land"] = value
+            elif level == "court":
+                kwargs["court_code"] = value
+            found, too_many, error = portal.search(**kwargs)
+            if error:
+                log.warning("[%s] %r/%s %s=%s: portal says %r", self.name, keyword, rtype, level, value, error)
+                complete = False
+                continue
+            if too_many:
+                if level == "all":
+                    queue += [["land", land] for land in LAENDER]
+                elif level == "land":
+                    queue += [["court", code] for _, code in portal.courts_of(value)]
+                else:
+                    log.warning("[%s] %r/%s still >100 hits at court %s - use a more specific keyword",
+                                self.name, keyword, rtype, value)
+                    complete = False
+                continue
+            leaves.append([level, value])
+            hits += found
+        log.info("[%s] %r/%s: %d hits in %d searches", self.name, keyword, rtype, len(hits), len(leaves))
+        if self.dry:
+            return
+        self.db.save_search_plan(key, leaves)
+        first_run = not self.db.search_baselined(key)
+        new = 0
+        for hit in hits:
+            if self.db.register_seen(hit.company_key):
+                continue
+            self.db.mark_register_seen(hit, key)
+            if first_run and not self.cfg.get("alert_on_first_run"):
+                continue
+            if self.db.add_register_candidate(hit, keyword):
+                new += 1
+        if first_run and complete:
+            self.db.mark_search_baselined(key)
+            log.info("[%s] %r/%s: baseline stored (%d companies, no alerts)", self.name, keyword, rtype, len(hits))
+        elif new:
+            log.info("[%s] %r/%s: %d new companies", self.name, keyword, rtype, new)
+
+    # -- phase 2: documents --------------------------------------------------------
+    def _resolve_candidates(self, portal: RegisterPortal) -> Iterator[Announcement]:
+        budget = int(self.cfg.get("max_documents_per_run", 25))
+        max_attempts = int(self.cfg.get("max_document_attempts", 6))
+        kinds = [k for k in self.cfg.get("documents") or ["AD", "SI"] if k in ("AD", "SI", "CD")]
+        for cand in self.db.register_candidates() if not self.dry else []:
+            if budget <= 0:
+                log.info("[%s] document budget used up, remaining candidates follow next run", self.name)
+                break
+            budget -= 1
+            text, error = "", ""
+            try:
+                code = portal.court_code(cand["court"])
+                hits, _, err = portal.search(register_type=cand["register_type"],
+                                             register_number=re.sub(r"\D", "", cand["register_number"]),
+                                             court_code=code)
+                hit = next((h for h in hits if h.company_key == cand["company_key"]), hits[0] if hits else None)
+                if hit is None:
+                    raise DocumentUnavailable(err or "company not found by register number")
+                for kind in kinds:
+                    try:
+                        data, ctype = portal.download(hit, kind)
+                        text = pdf_to_text(data) if ("pdf" in ctype or data[:4] == b"%PDF") else xjustiz_to_text(data)
+                        if text:
+                            break
+                    except DocumentUnavailable as exc:
+                        error = str(exc)
+                        if "A 450" in error:
+                            break  # portal-wide outage, other kinds will fail too
+            except (SourceError, requests.RequestException, DocumentUnavailable) as exc:
+                error = str(exc)
+                portal.on_form = False
+            attempts = int(cand["attempts"]) + 1
+            if not text and attempts < max_attempts:
+                self.db.candidate_attempt(cand["company_key"], error)
+                log.info("[%s] %s: document not available yet (%s) - retry next run", self.name, cand["name"], error)
+                continue
+            if not text:
+                log.warning("[%s] %s: no document after %d attempts - checking name/seat only",
+                            self.name, cand["name"], attempts)
+            uid = "hrs:" + cand["company_key"]
+            self._done[uid] = cand["company_key"]
+            header = f"{cand['name']}\n{cand['court']} {cand['register_number']}\nSitz: {cand['seat']}"
+            yield Announcement(
+                uid=uid, source=self.name, company_name=cand["name"], text=header + "\n\n" + text,
+                published=cand["found_at"][:10], court=cand["court"], register_type=cand["register_type"],
+                register_number=cand["register_number"], seat=cand["seat"], state=cand["land"],
+                announcement_type="Neu im Registerportal (Neueintragung oder Umfirmierung)",
+                event_hint="Neueintragung/Umfirmierung", url=RegisterPortal.BASE,
+                meta={"keyword": cand["keyword"]})
+
+    def commit(self, processed_uids: Iterable[str]) -> None:
+        if self.db is None or self.dry:
+            return
+        for uid in processed_uids:
+            if uid in self._done:
+                self.db.candidate_done(self._done[uid])
+
+
 # --------------------------------------------------------------------------
 # Persistence
 # --------------------------------------------------------------------------
@@ -1325,6 +1711,37 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_alerts_company ON alerts(company_key);
 CREATE INDEX IF NOT EXISTS idx_alerts_name ON alerts(name_key);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+
+-- register_search: every company ever seen in a search result, the learned
+-- partitioning per query and the candidates waiting for their documents
+CREATE TABLE IF NOT EXISTS register_seen (
+    company_key     TEXT PRIMARY KEY,
+    company_name    TEXT,
+    court           TEXT,
+    register_number TEXT,
+    query           TEXT,
+    first_seen      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS search_plans (
+    query      TEXT PRIMARY KEY,
+    plan       TEXT NOT NULL,
+    baselined  INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS register_candidates (
+    company_key     TEXT PRIMARY KEY,
+    name            TEXT,
+    court           TEXT,
+    register_type   TEXT,
+    register_number TEXT,
+    land            TEXT,
+    seat            TEXT,
+    keyword         TEXT,
+    found_at        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT
+);
 """
 
 
@@ -1376,6 +1793,55 @@ class Database:
                      json.dumps(alert_payload, ensure_ascii=False), utcnow()))
                 alert_id = cur.lastrowid
         return alert_id
+
+    # -- register_search state -------------------------------------------------
+    def register_seen(self, company_key: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM register_seen WHERE company_key=?", (company_key,)).fetchone() is not None
+
+    def mark_register_seen(self, hit: Any, query: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO register_seen VALUES (?,?,?,?,?,?)",
+                              (hit.company_key, hit.name, hit.court, hit.register_number, query, utcnow()))
+
+    def search_plan(self, query: str) -> Optional[List[List[str]]]:
+        row = self.conn.execute("SELECT plan FROM search_plans WHERE query=?", (query,)).fetchone()
+        return json.loads(row["plan"]) if row else None
+
+    def save_search_plan(self, query: str, plan: List[List[str]]) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO search_plans (query, plan, updated_at) VALUES (?,?,?) "
+                              "ON CONFLICT(query) DO UPDATE SET plan=excluded.plan, updated_at=excluded.updated_at",
+                              (query, json.dumps(plan), utcnow()))
+
+    def search_baselined(self, query: str) -> bool:
+        row = self.conn.execute("SELECT baselined FROM search_plans WHERE query=?", (query,)).fetchone()
+        return bool(row and row["baselined"])
+
+    def mark_search_baselined(self, query: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE search_plans SET baselined=1 WHERE query=?", (query,))
+
+    def add_register_candidate(self, hit: Any, keyword: str) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO register_candidates (company_key, name, court, register_type, "
+                "register_number, land, seat, keyword, found_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (hit.company_key, hit.name, hit.court, hit.register_type, hit.register_number, hit.land,
+                 hit.seat, keyword, utcnow()))
+        return cur.rowcount > 0
+
+    def register_candidates(self) -> List[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM register_candidates WHERE status='pending' ORDER BY found_at"))
+
+    def candidate_attempt(self, company_key: str, error: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE register_candidates SET attempts=attempts+1, last_error=? WHERE company_key=?",
+                              (error[:300], company_key))
+
+    def candidate_done(self, company_key: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE register_candidates SET status='done' WHERE company_key=?", (company_key,))
 
     def pending_alerts(self) -> List[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM alerts WHERE status = 'pending' ORDER BY id"))
@@ -1559,6 +2025,7 @@ class DiscordNotifier:
 SOURCE_CLASSES = {
     "github_snapshots": GitHubSnapshotSource,
     "handelsregister": HandelsregisterSource,
+    "register_search": RegisterSearchSource,
     "opencorporates": OpenCorporatesSource,
     "local": LocalInboxSource,
 }
@@ -1717,6 +2184,7 @@ def run(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 
     known = (lambda uid: False) if args.reprocess else db.is_processed
     for source in sources:
+        source.attach_db(db, dry)
         processed: List[str] = []
         log.info("[%s] fetching", source.name)
         try:
