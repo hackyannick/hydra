@@ -79,7 +79,7 @@
       "re:(?<![a-zäöüß])gast\\w*",
       "re:\\w*gassen?\\b",
       "re:\\w*gäss\\w*",
-      "Pegasus", "Vegas", "Gasperi", "Stromberg",
+      "Pegasus", "Vegas", "Gasperi", "Gassmann", "Gaßmann", "Gassner", "Gascogne", "Gaskell", "Stromberg",
       "re:(?<![a-zäöüß])stromer\\b",
       "re:(?<![a-zäöüß])stromlinie\\w*"
     ],

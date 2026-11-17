@@ -505,6 +505,19 @@ class Funnel:
                                         text[m.start():m.end()], self._context(text, *span), origin))
                 covered.append(span)
 
+        # the same entity/person often appears in the header and in the body
+        unique: Dict[Tuple[str, str], Finding] = {}
+        counts: Dict[Tuple[str, str], int] = {}
+        for f in findings:
+            key = (f.kind, f.summary)
+            counts[key] = counts.get(key, 0) + 1
+            unique.setdefault(key, f)
+        findings = []
+        for key, f in unique.items():
+            if counts[key] > 1:
+                f.summary += f" ({counts[key]}×)"
+            findings.append(f)
+
         keyword_hits: Dict[str, List[Tuple[int, int]]] = {}
         for label, pat in self.strong:
             for m in pat.finditer(masked):

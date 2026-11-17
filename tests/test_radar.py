@@ -66,7 +66,8 @@ class SectorFilter(unittest.TestCase):
     def test_gastro_and_street_names_are_not_gas(self):
         f = funnel()
         for text in ("Betrieb einer Gaststätte", "Gasthof zur Post", "Hauptgasse 4", "Gastronomie",
-                     "Pegasus Consulting", "Las Vegas Bar", "Stromberg Immobilien"):
+                     "Pegasus Consulting", "Las Vegas Bar", "Stromberg Immobilien",
+                     "Robin Gassmann Consulting KG", "Gascogne UG"):
             self.assertEqual(f.sector_hits(ann(text, name="Muster GmbH")), [], text)
 
     def test_biogas_survives_gast_exclusion(self):
@@ -134,6 +135,11 @@ class SwissDetection(unittest.TestCase):
 
     def test_all_caps_text(self):
         self.assertTrue(self.kinds("GESELLSCHAFTERIN: ALPINE ENERGY AG, ZUG (SCHWEIZ)"))
+
+    def test_entity_dedup_across_header_and_body(self):
+        res = funnel().swiss_findings("Inores GmbH (Schweiz) Zweigniederlassung\nText: Inores GmbH (Schweiz) wird gelöscht")
+        self.assertEqual(len(res), 1)
+        self.assertIn("2×", res[0].summary)
 
     def test_keyword_dedup_and_count(self):
         res = [f for f in funnel().swiss_findings("Schweiz ... Schweiz ... Schweiz") if f.kind == "keyword"]
