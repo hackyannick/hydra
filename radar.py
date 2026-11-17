@@ -91,6 +91,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "swiss_ambiguous_cities": [],
         "swiss_exclude": [],
         "swiss_legal_forms": ["AG", "SA", "GmbH", "Sàrl", "Sagl", "S.A."],
+        "swiss_places_file": "swiss_places.json",
     },
 }
 
@@ -329,6 +330,84 @@ def spans_overlap(span: Tuple[int, int], spans: Sequence[Tuple[int, int]]) -> bo
     return any(span[0] < e and s < span[1] for s, e in spans)
 
 
+CANTON_CODES = ("ZH", "BE", "LU", "UR", "SZ", "OW", "NW", "GL", "ZG", "FR", "SO", "BS", "BL", "SH",
+                "AR", "AI", "SG", "GR", "AG", "TG", "TI", "VD", "VS", "NE", "GE", "JU")
+# canton names that are also first names / German regions -> need corroboration
+AMBIGUOUS_CANTON_NAMES = {"Uri", "Jura", "Wallis", "Berna"}
+COUNTRY_RE = r"(?:Schweiz|Switzerland|Suisse|Svizzera|Svizra|Swiss|CH)"
+
+
+class SwissGazetteer:
+    """Every Swiss locality/municipality with postcodes and cantons, loaded from
+    swiss_places.json (built by tools/build_swiss_places.py). Names flagged 'de'
+    also exist as German places and are only trusted with extra evidence."""
+
+    CLEAN_RE = [
+        re.compile(rf"\s*[/,(]\s*{COUNTRY_RE}\s*\)?\s*$"),
+        re.compile(rf"\s+{COUNTRY_RE}\s*$"),
+        re.compile(r"^\s*(?:CH-?\s?)?\d{4}\s+"),
+        re.compile(r"^\s*(?:in|wohnhaft\s+in)\s+", re.IGNORECASE),
+    ]
+
+    def __init__(self, path: Optional[Path]) -> None:
+        self.places: Dict[str, Tuple[frozenset, bool]] = {}
+        self.plz: Dict[str, List[str]] = {}
+        self.cantons: Dict[str, List[str]] = {}
+        self.shared_canton_names: set = set()
+        self.max_tokens = 1
+        if not path:
+            return
+        if not path.is_file():
+            log.warning("Swiss gazetteer %s not found - only keyword/city lists are used", path)
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for name, rec in (data.get("places") or {}).items():
+            cantons = frozenset(c for c in re.split(r"[,\s]+", rec.get("c", "")) if c)
+            self.places[name] = (cantons, bool(rec.get("de")))
+            for code in rec.get("p") or []:
+                self.plz.setdefault(code, []).append(name)
+            self.max_tokens = max(self.max_tokens, min(6, len(name.split())))
+        for names in self.plz.values():
+            names.sort(key=len, reverse=True)
+        for code, rec in (data.get("cantons") or {}).items():
+            self.cantons[code] = list(rec.get("names") or [])
+            self.shared_canton_names.update(rec.get("shared_de") or [])
+        log.debug("Swiss gazetteer: %d places, %d postcodes", len(self.places), len(self.plz))
+
+    def __bool__(self) -> bool:
+        return bool(self.places)
+
+    def lookup(self, fragment: str) -> Optional[Tuple[str, frozenset, bool]]:
+        s = fragment.strip(" .;:")
+        for rx in self.CLEAN_RE:
+            s = rx.sub("", s)
+        s = s.strip(" .;:")
+        abbr = re.search(rf"\s*\(?\b({'|'.join(CANTON_CODES)})\)?$", s)
+        candidates = [s]
+        if abbr:
+            candidates.append(s[:abbr.start()].strip())
+        if "/" in s:  # bilingual names: "Biel/Bienne", "Disentis/Mustér"
+            candidates += [p.strip() for p in s.split("/") if p.strip()]
+        for cand in candidates:
+            if cand in self.places:
+                cantons, shared = self.places[cand]
+                if abbr and abbr.group(1) in cantons:
+                    shared = False  # "Wald ZH" is unambiguous
+                return cand, cantons, shared
+        return None
+
+    def prefix(self, s: str) -> Optional[Tuple[str, frozenset, bool, int]]:
+        """Longest Swiss place name at the start of s -> (name, cantons, shared, length)."""
+        tokens = list(re.finditer(r"[^\s,;:()]+", s[:120]))
+        for n in range(min(self.max_tokens, len(tokens)), 0, -1):
+            end = tokens[n - 1].end()
+            cand = s[:end].rstrip(".")
+            if cand in self.places:
+                cantons, shared = self.places[cand]
+                return cand, cantons, shared, len(cand)
+        return None
+
+
 class Funnel:
     LEADING_NOISE = re.compile(
         r"^(?:(?:die|der|das|dem|den|des|the|firma|gesellschafterin|gesellschafter|"
@@ -336,6 +415,13 @@ class Funnel:
         r"übertragende|übernehmende|aufnehmende|rechtsträgerin|mit|von|und|als)\s+)+",
         re.IGNORECASE,
     )
+    SEAT_RE = re.compile(
+        r"(?:mit\s+(?:Sitz|Satzungssitz|Hauptsitz|Verwaltungssitz|Wohnsitz)\s+in"
+        r"|wohnhaft\s+in|(?:Sitz|Wohnsitz)\s+(?:nach|in)|verlegt\s+nach"
+        r"|domicilié(?:e)?\s+à|(?:avec\s+)?siège(?:\s+social)?\s+à|con\s+sede\s+a|residente\s+a)"
+        r"\s+(?:CH-?\s?)?(?:(?P<plz>\d{4})\s+)?(?=[A-ZÄÖÜÉÈÂÎÔ])"
+    )
+    POSTCODE_RE = re.compile(r"(?<![\w.\-/+])(?P<ch>CH-?\s?)?(?P<plz>\d{4})\s+(?=[A-ZÄÖÜÉÈÂÎÔ])")
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.ctx = int(cfg.get("context_chars", 90))
@@ -345,49 +431,54 @@ class Funnel:
             name: compile_terms(pats, "substring")
             for name, pats in (cfg.get("event_patterns") or {}).items()
         }
+        places_file = cfg.get("swiss_places_file")
+        self.gaz = SwissGazetteer(Path(places_file) if places_file else None)
+
+        canton_names = [n for names in self.gaz.cantons.values() for n in names]
+        ambiguous_cantons = [n for n in canton_names
+                             if n in self.gaz.shared_canton_names or n in AMBIGUOUS_CANTON_NAMES]
+        strong_cantons = [n for n in canton_names if n not in ambiguous_cantons]
+
         cities = list(dict.fromkeys(cfg.get("swiss_cities") or []))
         self.swiss_keywords = compile_terms(cfg.get("swiss_keywords"), "word")
-        self.swiss_cities = compile_terms(cities, "word")
-        self.ambiguous = compile_terms(cfg.get("swiss_ambiguous_cities"), "word")
+        self.swiss_cities = compile_terms(list(dict.fromkeys(cities + strong_cantons)), "word")
+        self.ambiguous = compile_terms(
+            list(dict.fromkeys(list(cfg.get("swiss_ambiguous_cities") or []) + ambiguous_cantons)), "word")
         self.swiss_exclude = compile_terms(cfg.get("swiss_exclude"), "substring")
         self.strong = self.swiss_keywords + self.swiss_cities
 
-        city_names = [c for c in cities + [k for k in (cfg.get("swiss_keywords") or [])]
-                      if not c.startswith("re:") and c[:1].isalpha() and c[0].isupper()
-                      and not c.isupper() and c.lower() not in ("schweiz", "switzerland", "swiss", "suisse",
-                                            "svizzera", "kanton")]
-        all_cities = city_names + [c for c in (cfg.get("swiss_ambiguous_cities") or [])
-                                   if not c.startswith("re:")]
-        city_alt = "|".join(sorted((re.escape(c).replace(r"\ ", r"\s+") for c in city_names),
+        def alt(names: Iterable[str]) -> str:
+            return "|".join(sorted({re.escape(n).replace(r"\ ", r"\s+") for n in names},
                                    key=len, reverse=True)) or r"(?!x)x"
-        all_city_alt = "|".join(sorted((re.escape(c).replace(r"\ ", r"\s+") for c in all_cities),
-                                       key=len, reverse=True)) or r"(?!x)x"
-        amb = [c for c in (cfg.get("swiss_ambiguous_cities") or []) if not c.startswith("re:")]
-        amb_alt = "|".join(sorted((re.escape(c).replace(r"\ ", r"\s+") for c in amb),
-                                  key=len, reverse=True)) or r"(?!x)x"
-        forms = "|".join(sorted((re.escape(f) for f in cfg.get("swiss_legal_forms") or ["AG"]),
-                                key=len, reverse=True))
-        country = r"(?:Schweiz|Switzerland|Suisse|Svizzera|Swiss|CH)"
-        postal = r"(?:CH-?\s?)?(?:\d{4}\s+)?"
+
+        curated = [c for c in cities + list(cfg.get("swiss_keywords") or [])
+                   if not c.startswith("re:") and c[:1].isalpha() and c[0].isupper()
+                   and not c.isupper() and c.lower() not in ("schweiz", "switzerland", "swiss", "suisse",
+                                                             "svizzera", "kanton", "eidgenossenschaft")]
+        self.curated_city_re = re.compile(rf"(?:{alt(curated)})(?![\w])")
+        forms = alt(cfg.get("swiss_legal_forms") or ["AG"])
+        seat_words = r"(?:mit\s+(?:Sitz|Satzungssitz|Hauptsitz|Verwaltungssitz)\s+in|in|aus)"
         self.entity_re = re.compile(
             rf"(?P<name>(?:[A-ZÄÖÜ0-9][\w&'’.+\-]*\s+(?:&\s+|und\s+)?){{1,7}}?(?:{forms}))(?![\w])"
-            rf"(?:\s*\(\s*{country}\s*\)"
-            rf"|\s*,\s*{postal}(?P<c1>{city_alt})(?![\w])(?:\s*[(/,]\s*{country}\)?)?"
-            rf"|\s+(?:mit\s+(?:Sitz|Satzungssitz|Hauptsitz|Verwaltungssitz)\s+in|in|aus)\s+"
-            rf"{postal}(?P<c2>{city_alt})(?![\w])(?:\s*[(/,]\s*{country}\)?)?"
-            rf"|(?:\s*,|\s+(?:mit\s+(?:Sitz|Satzungssitz|Hauptsitz|Verwaltungssitz)\s+in|in|aus))\s*"
-            rf"{postal}(?P<c3>{amb_alt})\s*[(/,]\s*{country}\)?"
-            rf"|\s*,\s*{country}(?![\w])"
-            rf"|\s+nach\s+schweizerischem\s+Recht)"
+            rf"(?:(?P<paren>\s*\(\s*{COUNTRY_RE}\s*\))"
+            rf"|(?P<comma>\s*,\s*{COUNTRY_RE}(?![\w]))"
+            rf"|(?P<law>\s+nach\s+schweizerischem\s+Recht)"
+            rf"|(?:\s*,\s*|\s+{seat_words}\s+)(?:CH-?\s?)?(?:(?P<plz>\d{{4}})\s+)?(?=[A-ZÄÖÜÉÈÂÎÔ]))"
         )
+        self.canton_ref_re = re.compile(
+            rf"(?:Kantons?|Kt\.|[Cc]anton(?:e|s)?(?:\s+(?:de|du|des|di|del|dello))?|[Cc]anton\s+d['’])\s*"
+            rf"(?P<c>{alt(canton_names + list(CANTON_CODES))})(?![\w])"
+        )
+        self.abbr_re = re.compile(rf"(?<![\w\-])(?P<open>\()?(?P<a>{'|'.join(CANTON_CODES)})(?P<close>\))?(?![\w\-])")
         self.identifiers: List[Tuple[str, "re.Pattern[str]"]] = [
             ("Swiss company UID", re.compile(r"(?<![\w])CHE[-\s]?\d{3}\.\d{3}\.\d{3}(?![\d])")),
             ("Swiss postcode", re.compile(r"(?<![\w])CH-\s?\d{4}(?!\d)")),
-            ("Swiss address", re.compile(rf"(?<![\d.])\d{{4}}\s+(?:{all_city_alt})(?![\w])")),
             ("Swiss phone number", re.compile(r"(?<![\w+])(?:\+|00)41[\s\-/]?\d{2}[\s\-/]?\d{3}")),
             ("Swiss web/e-mail domain",
              re.compile(r"(?:www\.|@|https?://)[\w.\-]+\.ch(?![\w.])", re.IGNORECASE)),
         ]
+        if not self.gaz:  # fallback without gazetteer: postcode + curated city
+            self.identifiers.append(("Swiss address", re.compile(rf"(?<![\d.])\d{{4}}\s+(?:{alt(curated)})(?![\w])")))
 
     # -- step 1 ------------------------------------------------------------
     def sector_hits(self, ann: Announcement) -> List[str]:
@@ -408,7 +499,7 @@ class Funnel:
                 found.append(name)
         return list(dict.fromkeys(found))
 
-    # -- step 2 ------------------------------------------------------------
+    # -- step 2 helpers ----------------------------------------------------
     def _context(self, text: str, start: int, end: int) -> str:
         a, b = max(0, start - self.ctx), min(len(text), end + self.ctx)
         snippet = text[a:start] + "«" + text[start:end] + "»" + text[end:b]
@@ -416,23 +507,59 @@ class Funnel:
         return ("…" if a > 0 else "") + snippet + ("…" if b < len(text) else "")
 
     def swiss_signal(self, masked_fragment: str) -> Optional[str]:
-        for label, pat in self.strong:
+        """Strong signal (country word, canton, curated city, identifier) in a fragment."""
+        for _, pat in self.strong:
             m = pat.search(masked_fragment)
             if m:
                 return m.group(0)
-        for _, pat in self.identifiers:
-            m = pat.search(masked_fragment)
+        for rx in [self.canton_ref_re] + [p for _, p in self.identifiers]:
+            m = rx.search(masked_fragment)
             if m:
                 return m.group(0)
         return None
 
+    @staticmethod
+    def _canton_label(cantons: frozenset) -> str:
+        return "/".join(sorted(cantons))
+
+    def _place_at(self, masked: str, pos: int, plz: Optional[str] = None) -> Optional[Tuple[str, str, int]]:
+        """Validated Swiss place starting at masked[pos] -> (name, canton label, end).
+        Places that also exist in Germany need a matching postcode, a canton
+        abbreviation or a strong Swiss signal right after them."""
+        m = self.curated_city_re.match(masked, pos)
+        hit = self.gaz.prefix(masked[pos:]) if self.gaz else None
+        if hit:
+            name, cantons, shared, length = hit
+            end = pos + length
+            ok = (not shared) or (plz is not None and name in self.gaz.plz.get(plz, ())) \
+                or bool(self.swiss_signal(masked[end:end + 60]))
+            nxt = re.match(rf"\s*\(?({'|'.join(CANTON_CODES)})\)?(?![\w])", masked[end:])
+            label = self._canton_label(cantons)
+            if nxt and nxt.group(1) in cantons:
+                ok, end, label = True, end + nxt.end(), nxt.group(1)
+            if ok:
+                return name, label, end
+        if m:
+            return m.group(0), "", m.end()
+        return None
+
+    def _location_part(self, masked_part: str) -> bool:
+        if self.swiss_signal(masked_part):
+            return True
+        if not self.gaz:
+            return False
+        pm = re.search(r"(?<!\d)(\d{4})\s+(.+)$", masked_part)
+        if pm and pm.group(2).strip(" .") in self.gaz.plz.get(pm.group(1), ()):
+            return True
+        hit = self.gaz.lookup(masked_part)
+        return bool(hit and not hit[2])
+
     def _persons(self, text: str, masked: str) -> Iterator[Tuple[Finding, Tuple[int, int]]]:
         """Register-style person entries: 'Name, Vorname, Ort, *TT.MM.JJJJ' and
-        'Name, Vorname, *TT.MM.JJJJ, Ort/Schweiz'."""
+        'Name, Vorname, *TT.MM.JJJJ, Ort/Schweiz'. Ort can be any Swiss place."""
         role = ""
         for seg in re.finditer(r"[^;\n]+", masked):
             s0 = seg.start()
-            # split off role labels like "Geschäftsführer:" / "Prokura erloschen:"
             pieces: List[Tuple[int, int]] = []
             last = 0
             seg_text = seg.group(0)
@@ -449,28 +576,35 @@ class Funnel:
                 piece_m = seg_text[ps:pe]
                 if len(piece_m) > 260 or not DOB_RE.search(piece_m):
                     continue
-                signal = self.swiss_signal(piece_m)
-                if not signal:
-                    continue
                 start, end = s0 + ps, s0 + pe
                 piece = text[start:end]
+                parts = [p.strip(" .") for p in piece.split(",")]
+                masked_parts = [p.strip(" .") for p in piece_m.split(",")]
+                keep = [i for i, p in enumerate(parts) if p]
+                parts = [parts[i] for i in keep]
+                masked_parts = [masked_parts[i] for i in keep]
+                flagged = [i for i in range(2, len(parts))
+                           if not DOB_RE.search(parts[i]) and self._location_part(masked_parts[i])]
+                if not flagged:
+                    continue
+                # "Keller, Urs, Baar, Schweiz" -> show "Baar, Schweiz"
+                for i in list(flagged):
+                    if re.fullmatch(COUNTRY_RE, masked_parts[i]) and i - 1 >= 2 and i - 1 not in flagged \
+                            and not DOB_RE.search(parts[i - 1]):
+                        flagged.append(i - 1)
+                flagged.sort()
+                location = ", ".join(parts[i] for i in flagged)
+                name = ", ".join(parts[:2])
                 dob_m = DOB_RE.search(piece)
-                parts = [p.strip(" .") for p in piece.split(",") if p.strip(" .")]
-                masked_parts = [p.strip(" .") for p in piece_m.split(",") if p.strip(" .")]
-                location = [p for p, mp in zip(parts, masked_parts)
-                            if self.swiss_signal(mp) and not DOB_RE.search(p)]
-                names = [p for p, mp in zip(parts, masked_parts)
-                         if not DOB_RE.search(p) and p not in location][:2]
-                name = ", ".join(names) or "unknown"
                 dob = f" (*{dob_m.group(1)})" if dob_m else ""
-                who = role or "Person"
-                summary = f"{who}: {name}{dob} – residence: {', '.join(location) or signal}"
+                summary = f"{role or 'Person'}: {name}{dob} – residence: {location}"
                 lead = len(piece) - len(piece.lstrip())
                 yield (Finding("person", summary, piece.strip(),
                                self._context(text, start + lead, end)), (start, end))
             if not seg_text.strip():
                 role = ""
 
+    # -- step 2 ------------------------------------------------------------
     def swiss_findings(self, text: str, origin: str = "text") -> List[Finding]:
         text = normalize_text(text)
         if not text:
@@ -479,31 +613,75 @@ class Funnel:
         findings: List[Finding] = []
         covered: List[Tuple[int, int]] = []
 
+        def add(kind: str, summary: str, s: int, e: int) -> None:
+            findings.append(Finding(kind, summary, text[s:e], self._context(text, s, e), origin))
+            covered.append((s, e))
+
         for finding, span in self._persons(text, masked):
             finding.origin = origin
             findings.append(finding)
             covered.append(span)
 
         for m in self.entity_re.finditer(masked):
-            span = (m.start(), m.end())
-            if spans_overlap(span, covered):
+            if spans_overlap((m.start(), m.end()), covered):
                 continue
             name = self.LEADING_NOISE.sub("", text[m.start("name"):m.end("name")]).strip()
-            grp = next((g for g in ("c1", "c2", "c3") if m.group(g)), None)
-            where = f"seat: {text[m.start(grp):m.end(grp)]}" if grp \
-                else text[m.end("name"):m.end()].strip(" ,()")
-            findings.append(Finding("entity", f"Swiss legal entity: {name} ({where})",
-                                    text[m.start():m.end()], self._context(text, *span), origin))
-            covered.append(span)
+            if m.group("paren") or m.group("comma") or m.group("law"):
+                add("entity", f"Swiss legal entity: {name} ({text[m.end('name'):m.end()].strip(' ,()')})",
+                    m.start(), m.end())
+                continue
+            place = self._place_at(masked, m.end(), m.group("plz"))
+            if not place:
+                continue
+            pname, canton, end = place
+            tail = re.match(rf"\s*[(/,]\s*{COUNTRY_RE}\)?", masked[end:])
+            end += tail.end() if tail else 0
+            add("entity", f"Swiss legal entity: {name} (seat: {pname}{' ' + canton if canton else ''})",
+                m.start(), end)
+
+        for m in self.SEAT_RE.finditer(masked):
+            if spans_overlap((m.start(), m.end()), covered):
+                continue
+            place = self._place_at(masked, m.end(), m.group("plz"))
+            if place:
+                pname, canton, end = place
+                add("location", f"Swiss seat/residence: {pname}{' (' + canton + ')' if canton else ''}",
+                    m.start(), end)
+
+        for m in self.canton_ref_re.finditer(masked):
+            if not spans_overlap((m.start(), m.end()), covered):
+                add("location", f"Swiss canton: {text[m.start():m.end()]}", m.start(), m.end())
+
+        if self.gaz:
+            for m in self.POSTCODE_RE.finditer(masked):
+                if spans_overlap((m.start(), m.end()), covered):
+                    continue
+                for pname in self.gaz.plz.get(m.group("plz"), ()):
+                    e = m.end() + len(pname)
+                    if masked.startswith(pname, m.end()) and (e >= len(masked) or not masked[e].isalnum()):
+                        canton = self._canton_label(self.gaz.places[pname][0])
+                        add("identifier", f"Swiss address: {text[m.start():e]} ({canton})", m.start(), e)
+                        break
+            for m in self.abbr_re.finditer(masked):
+                if spans_overlap((m.start(), m.end()), covered):
+                    continue
+                if m.group("a") == "AG" and not (m.group("open") and m.group("close")):
+                    continue  # "Baden AG" is usually a legal form, "Baden (AG)" a canton
+                before = masked[max(0, m.start() - 50):m.start()].rstrip()
+                toks = list(re.finditer(r"[^\s,;:()]+", before))
+                for n in range(min(4, len(toks)), 0, -1):
+                    s = toks[-n].start()
+                    cand = before[s:].strip()
+                    info = self.gaz.places.get(cand)
+                    if info and m.group("a") in info[0]:
+                        abs_s = max(0, m.start() - 50) + s
+                        add("location", f"Swiss place: {text[abs_s:m.end()]}", abs_s, m.end())
+                        break
 
         for label, pat in self.identifiers:
             for m in pat.finditer(masked):
-                span = (m.start(), m.end())
-                if spans_overlap(span, covered):
-                    continue
-                findings.append(Finding("identifier", f"{label}: {text[m.start():m.end()]}",
-                                        text[m.start():m.end()], self._context(text, *span), origin))
-                covered.append(span)
+                if not spans_overlap((m.start(), m.end()), covered):
+                    add("identifier", f"{label}: {text[m.start():m.end()]}", m.start(), m.end())
 
         # the same entity/person often appears in the header and in the body
         unique: Dict[Tuple[str, str], Finding] = {}
@@ -530,8 +708,7 @@ class Funnel:
                 span = (m.start(), m.end())
                 if spans_overlap(span, covered):
                     continue
-                near = any(abs(s - span[0]) <= 120 for s, _ in strong_positions)
-                if near:
+                if any(abs(s - span[0]) <= 120 for s, _ in strong_positions):
                     keyword_hits.setdefault(label, []).append(span)
         for label, spans in keyword_hits.items():
             s, e = spans[0]
@@ -1404,6 +1581,8 @@ def load_config(path: Path) -> Dict[str, Any]:
     cfg["database"]["path"] = str(resolve_path(cfg["database"]["path"], base))
     cfg["logging"]["dir"] = str(resolve_path(cfg["logging"]["dir"], base))
     cfg["run"]["lock_file"] = str(resolve_path(cfg["run"]["lock_file"], base))
+    if cfg["detection"].get("swiss_places_file"):
+        cfg["detection"]["swiss_places_file"] = str(resolve_path(cfg["detection"]["swiss_places_file"], base))
     local = cfg["sources"].get("local") or {}
     for key in ("inbox_dir", "archive_dir"):
         if local.get(key):

@@ -11,7 +11,7 @@ id "$USER_NAME" >/dev/null 2>&1 || \
     useradd --system --home-dir "$DEST" --shell /usr/sbin/nologin "$USER_NAME"
 
 mkdir -p "$DEST/data"
-cp radar.py requirements.txt "$DEST/"
+cp radar.py requirements.txt swiss_places.json "$DEST/"
 [ -f "$DEST/config.json" ] || cp config.json "$DEST/config.json"   # never overwrite a live config
 chown -R "$USER_NAME:$USER_NAME" "$DEST"
 chmod 600 "$DEST/config.json"

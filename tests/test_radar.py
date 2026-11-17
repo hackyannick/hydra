@@ -147,6 +147,77 @@ class SwissDetection(unittest.TestCase):
         self.assertIn("3×", res[0].summary)
 
 
+class WholeSwitzerland(unittest.TestCase):
+    """Any Swiss place must be recognised in structured contexts; German homonyms must not."""
+
+    POSITIVE = [
+        "Geschäftsführer: Rochat, Pierre, Yverdon-les-Bains, *03.04.1972",
+        "Geschäftsführer: Bianchi, Luca, Mendrisio, *05.06.1980",
+        "Prokura: Caduff, Gian, *01.01.1975, Disentis/Mustér",
+        "Geschäftsführer: Meier, Hans, Speicher AR, *01.01.1970",
+        "Geschäftsführer: Weber, Anna, Au (SG), *01.01.1970",
+        "Gesellschafterin ist die Rhône Energie SA, Martigny",
+        "Gesellschafterin: Bodensee Strom AG mit Sitz in Kreuzlingen",
+        "Alleingesellschafterin ist die Thurwerk AG, Wil SG",
+        "Gesellschafter: Engadin Energie AG, Scuol",
+        "Gesellschafterin: Alpenkraft GmbH, Cham, Kanton Zug",
+        "Die Gesellschaft hat ihren Sitz nach Delémont verlegt.",
+        "domiciliée à Fribourg",
+        "Geschäftsanschrift: Rue du Lac 5, 1800 Vevey",
+        "eingetragen im Handelsregister des Kantons Graubünden",
+        "Holding mit Sitz im Kanton Tessin",
+        "Gegenstand: Stromhandel im Wallis und Kanton Uri",
+    ]
+    NEGATIVE = [
+        "Geschäftsführer: Meier, Hans, Speicher, *01.01.1970",
+        "Geschäftsführer: Meier, Hans, Wald, *01.01.1970",
+        "Errichtung eines Speicher für Strom in Bauen und Port",
+        "Gesellschafterin: Stadtwerke Konstanz GmbH, Konstanz",
+        "Geschäftsführer: Cohen, Uri, Berlin, *01.01.1970",
+        "Gesellschafterin ist die Energie Baden AG, Karlsruhe",
+        "Schwarzwald-Baar-Kreis Energieversorgung",
+        "Geschäftsanschrift: Marktplatz 2, 79098 Freiburg im Breisgau",
+        "Gesellschafterin: Stadtwerke Neuenburg GmbH, Neuenburg am Rhein",
+        "Gesellschafterin ist die Ostsee Energie GmbH, Tessin",
+        "Die Gesellschaft hat ihren Sitz nach Au verlegt.",
+        "Gesellschafter: Müller Bau AG, Hauptstraße 5",
+        "Kapital: 2500 Euro",
+        "Geschäftsführer: Meyer, Peter, Wien, *01.01.1970; 1010 Wien",
+        "Wartung von Anlagen im Jura (Schwäbische Alb)",
+    ]
+
+    def test_gazetteer_loaded(self):
+        f = funnel()
+        self.assertGreater(len(f.gaz.places), 4000)
+        self.assertEqual(len(f.gaz.cantons), 26)
+        self.assertIn("Vevey", f.gaz.plz["1800"])
+
+    def test_positive(self):
+        f = funnel()
+        for text in self.POSITIVE:
+            self.assertTrue(f.swiss_findings(text), text)
+
+    def test_negative(self):
+        f = funnel()
+        for text in self.NEGATIVE:
+            self.assertEqual([x.summary for x in f.swiss_findings(text)], [], text)
+
+    def test_canton_specific_label(self):
+        res = funnel().swiss_findings("Alleingesellschafterin ist die Thurwerk AG, Wil SG")
+        self.assertEqual(res[0].summary, "Swiss legal entity: Thurwerk AG (seat: Wil SG)")
+
+    def test_postcode_must_belong_to_place(self):
+        f = funnel()
+        self.assertTrue(f.swiss_findings("Rue du Lac 5, 1800 Vevey"))
+        self.assertEqual(f.swiss_findings("Rue du Lac 5, 8001 Vevey"), [])  # 8001 is Zürich
+
+    def test_works_without_gazetteer(self):
+        det = dict(CFG["detection"], swiss_places_file=str(HERE / "does-not-exist.json"))
+        f = radar.Funnel(det)
+        self.assertTrue(f.swiss_findings("Geschäftsführer: Keller, Urs, Zug / Schweiz, *14.02.1971"))
+        self.assertEqual(f.swiss_findings("Geschäftsführer: Rochat, Pierre, Yverdon-les-Bains, *03.04.1972"), [])
+
+
 class FixtureFunnel(unittest.TestCase):
     def evaluate(self, name):
         text = (FIX / name).read_text(encoding="utf-8")

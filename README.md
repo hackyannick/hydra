@@ -19,7 +19,10 @@ Switzerland** and posts each hit to a Discord channel.
 hydra-radar/
 ├── radar.py                 # the whole tool (single file, Python ≥ 3.9)
 ├── config.json              # webhook, sources, keyword lists
+├── swiss_places.json        # gazetteer: all ~4,300 Swiss localities/municipalities, postcodes, cantons
 ├── requirements.txt
+├── tools/
+│   └── build_swiss_places.py  # rebuilds swiss_places.json
 ├── deploy/
 │   ├── install.sh           # Debian installer (/opt/hydra-radar, system user "hydra")
 │   └── hydra-radar.cron     # /etc/cron.d entry
@@ -61,19 +64,41 @@ and full text, so compounds like *Ökostrom*, *Erdgas* and *Gasversorgung*
 count. `sector_exclude` blanks out look-alikes first: *Gaststätte*, *Gasthof*,
 *Hauptgasse*, *Pegasus*, *Stromberg*, and so on.
 
-**Step 2 – Swiss link.** The findings are listed in the alert, most specific
+**Step 2 – Swiss link (all of Switzerland).** Hydra-Radar ships a gazetteer
+(`swiss_places.json`) with **every Swiss locality and municipality: about 4,300
+names, 3,448 postcodes, all 26 cantons**. It recognises any Swiss place,
+not just a few regions. The findings are listed in the alert, most specific
 first:
 
-* **person**: register-style entries in both orders,
-  `Keller, Urs, Baar / Schweiz, *14.02.1971` and
-  `Müller, Hans, *01.02.1970, Zürich/Schweiz`, with the role taken from the
+* **person**: register-style entries in both orders, with **any Swiss place**
+  as residence: `Rochat, Pierre, Yverdon-les-Bains, *03.04.1972`,
+  `Keller, Urs, Baar / Schweiz, *14.02.1971`,
+  `Caduff, Gian, *01.01.1975, Disentis/Mustér`. The role comes from the
   preceding label (*Geschäftsführer:*, *Prokura:*, *Vorstand:* …)
-* **entity**: `… AG, Zug`, `… AG mit Sitz in Stans`, `… GmbH (Schweiz)`,
-  `… SA, CH-6900 Lugano`, `… AG nach schweizerischem Recht`
-* **identifier**: Swiss UID `CHE-123.456.789`, `CH-6300`, a 4-digit postcode
-  followed by a Swiss town, `+41 …` phone numbers, `.ch` web or e-mail domains
-* **keyword**: `Schweiz`, `Switzerland`, `CH-`, `Zug`, `Stans`, `Zürich`,
-  `Luzern`, `Schwyz`, `Nidwalden`, plus the extended town list in `config.json`
+* **entity**: a legal form followed by any Swiss place:
+  `… SA, Martigny`, `… AG mit Sitz in Kreuzlingen`, `… AG, Wil SG`,
+  `… GmbH (Schweiz)`, `… Sàrl, Nyon`, `… AG nach schweizerischem Recht`
+* **location**:
+  - seat or residence phrases with any Swiss place: *mit Sitz in / Sitz nach … verlegt / wohnhaft in / domicilié à / con sede a*
+  - canton references: *Kanton(s) Graubünden*, *canton de Vaud*, *Kt. ZH*
+  - a place followed by its canton abbreviation: *Wil SG*, *Muri (AG)*
+* **identifier**:
+  - Swiss postal address, accepted only if the postcode really belongs to the place (`1800 Vevey` yes, `8001 Vevey` no)
+  - Swiss UID `CHE-123.456.789`, `CH-6300`, `+41 …` phone numbers, `.ch` web or e-mail domains
+* **keyword** in free text:
+  - country words (*Schweiz, Switzerland, Suisse, Svizzera, Swiss, schweizerisch …*)
+  - all 26 **canton names in every national language** (*Graubünden/Grisons/Grigioni, Waadt/Vaud, Tessin/Ticino …*)
+  - the city list in `config.json`
+
+**Why not every one of the 4,300 place names in free text?** Many Swiss place
+names are ordinary German words or also German places: *Speicher* (AR) appears
+in every energy text as "Stromspeicher", and *Wald*, *Au*, *Egg*, *Cham*,
+*Ins*, *Port* and others are similar. So individual places count wherever the
+text structure shows a place: address, residence, company seat, canton
+abbreviation. The gazetteer flags the 142 names that also exist as German
+places (from the Destatis municipality register). They only count with extra
+evidence: a matching Swiss postcode, a canton abbreviation (*Speicher AR*,
+*Wald ZH*) or a Swiss signal right after them.
 
 Precautions against false positives (all configurable):
 
@@ -82,8 +107,13 @@ Precautions against false positives (all configurable):
 * Towns match in their exact case or in ALL CAPS.
 * `swiss_exclude` removes *Sächsische/Fränkische/Holsteinische … Schweiz*,
   *Zug um Zug*, *Basel III* and similar phrases.
-* `swiss_ambiguous_cities` (Cham, Rheinfelden, Laufenburg, …) only count when
-  another Swiss signal appears within 120 characters.
+* `swiss_ambiguous_cities` and canton names that are also German places or
+  first names (*Freiburg, Neuenburg, Tessin, Berne, Uri, Jura, Wallis*) only
+  count when another Swiss signal appears within 120 characters, or after
+  *Kanton …*.
+
+Validation against 4,020 real announcements (13 Oct – 15 Nov 2026): 2 hits,
+both genuine Swiss links, no false positives.
 
 Try the filter on any text:
 
@@ -193,6 +223,22 @@ keywords. Combine it with `--dry-run`.
 
 Records in the coezbek snapshot schema (`details`, `registernummer`, …) are
 also accepted.
+
+## Rebuilding the Swiss gazetteer
+
+`swiss_places.json` is generated from MIT-licensed npm packages
+(`switzerland-postal-codes`, `@onebyte/swiss-postal-codes`; German comparison
+data: `gemeindeverzeichnis` (Destatis GV100), `postleitzahlen`):
+
+```bash
+for p in switzerland-postal-codes @onebyte/swiss-postal-codes gemeindeverzeichnis postleitzahlen; do npm pack $p; done
+# unpack each *.tgz, then:
+python3 tools/build_swiss_places.py --ch-tsv .../data/postal-codes.tsv --ch-communes .../data.json \
+    --de-gemeinden .../gemeinden.ndjson --de-orte .../data/ort.json -o swiss_places.json
+```
+
+If the file is missing, Hydra-Radar logs a warning and falls back to the
+keyword and city lists.
 
 ## Legal / ethics
 

@@ -108,13 +108,13 @@
       "Chur", "Schaffhausen", "Biel", "Thun", "Aarau", "Olten", "Solothurn", "Fribourg",
       "Freiburg im Üechtland", "Neuchâtel", "Sion", "Locarno", "Bellinzona", "Kreuzlingen",
       "Frauenfeld", "Herisau", "Glarus", "Sarnen", "Stansstad", "Hergiswil", "Buochs",
-      "Baar", "Rotkreuz", "Hünenberg", "Pfäffikon", "Freienbach", "Wollerau",
+      "Rotkreuz", "Hünenberg", "Pfäffikon", "Freienbach", "Wollerau",
       "Küssnacht", "Einsiedeln", "Zollikon", "Küsnacht", "Kloten", "Opfikon", "Dübendorf",
       "Wallisellen", "Schlieren", "Dietikon", "Horgen", "Thalwil", "Uster", "Kriens", "Emmen",
       "Ebikon", "Allschwil", "Muttenz", "Pratteln", "Liestal", "Zofingen", "Wettingen"
     ],
     "_ambiguous_comment": "Places that also exist in Germany. They only count when another Swiss signal is within 120 characters.",
-    "swiss_ambiguous_cities": ["Cham", "Rheinfelden", "Laufenburg", "Altdorf", "Steinhausen", "Arbon"],
+    "swiss_ambiguous_cities": ["Baar", "Cham", "Rheinfelden", "Laufenburg", "Altdorf", "Steinhausen", "Arbon"],
     "swiss_exclude": [
       "re:(?:Sächsische|Fränkische|Holsteinische|Märkische|Mecklenburgische|Böhmische|Ruppiner|Hersbrucker|Luxemburger|Pfälzische|Wetterauer|Hessische|Kasseler)[nrs]?\\s+Schweiz",
       "Zug um Zug",
@@ -122,6 +122,8 @@
       "re:Bern(?:hard|d|ward|t)\\b",
       "re:Basel\\s+(?:III|IV|II)\\b"
     ],
+    "_places_comment": "Complete Swiss gazetteer (all ~4,300 localities/municipalities, postcodes, cantons). Any Swiss place is recognised in structured contexts: address with postcode, residence of a person, seat of a company, 'Ort KT' / 'Kanton X'. Names that also exist in Germany need extra evidence. Rebuild with tools/build_swiss_places.py.",
+    "swiss_places_file": "swiss_places.json",
     "swiss_legal_forms": ["AG", "SA", "S.A.", "GmbH", "Sàrl", "S.à r.l.", "Sagl", "Genossenschaft", "Holding"]
   }
 }
