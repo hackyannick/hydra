@@ -302,6 +302,25 @@ class HandelsregisterParsing(unittest.TestCase):
         self.assertEqual(radar.HandelsregisterSource.find_remote_command(soup, self.PAGE),
                          "bekanntMachungenForm:j_idt999")
 
+    def test_remote_command_current_portal(self):
+        # verbatim structure of the live page (Nov 2026)
+        page = """<form id="bekanntMachungenForm"><script id="bekanntMachungenForm:j_idt173" type="text/javascript">
+remoteBekanntmachung = function() {PrimeFaces.ab({s:"bekanntMachungenForm:j_idt173",f:"bekanntMachungenForm",
+p:"bekanntMachungenForm",u:"bekanntMachungenForm",pa:arguments[0]});}</script>
+<a onclick="fireBekanntmachung2('Tue Nov 17 00:00:00 CET 2026', '184749');;return false;">x</a>
+<script>function fireBekanntmachung2(datum, id){ remoteBekanntmachung([{name:'datum', value:datum}, {name:'id', value:id}]); }</script>
+</form>"""
+        soup = radar.BeautifulSoup(page, "lxml")
+        self.assertEqual(radar.HandelsregisterSource.find_remote_command(soup, page), "bekanntMachungenForm:j_idt173")
+
+    def test_ad_print_real_layout(self):
+        """Real current print (AD) of handelsregister.de, anonymised, Swiss residence inserted."""
+        text = (FIX / "portal_ad_print.text").read_text(encoding="utf-8")
+        a = radar.Announcement(uid="t", source="t", company_name="Muster Strom und Chemiehandel GmbH", text=text)
+        ev = funnel().evaluate(a)
+        self.assertTrue(ev.alert)
+        self.assertEqual(ev.findings[0].summary, "Geschäftsführer: Muster, Max (*01.01.1970) – residence: Küssnacht am Rigi")
+
     def test_result_list_and_detail(self):
         html, vs = radar.HandelsregisterSource.parse_partial_response(self.RESULT)
         self.assertEqual(vs, "-999:111")

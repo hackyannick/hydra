@@ -976,10 +976,13 @@ class HandelsregisterSource(Source):
                 log.warning("[%s] max_details_per_run=%d reached, rest follows next run",
                             self.name, max_details)
                 break
-            data = {"javax.faces.partial.ajax": "true", "javax.faces.source": remote_id,
-                    "javax.faces.partial.execute": self.FORM, "javax.faces.partial.render": self.FORM,
-                    remote_id: remote_id, "datum": entry["datum"], "id": entry["id"],
-                    self.FORM: self.FORM, "javax.faces.ViewState": view_state}
+            # the remote command processes the whole form (p:"bekanntMachungenForm"), so all
+            # form fields incl. the mandatory date range must be sent, or validation fails
+            data = dict(fields)
+            data.update({"javax.faces.partial.ajax": "true", "javax.faces.source": remote_id,
+                         "javax.faces.partial.execute": self.FORM, "javax.faces.partial.render": self.FORM,
+                         remote_id: remote_id, "datum": entry["datum"], "id": entry["id"],
+                         self.FORM: self.FORM, "javax.faces.ViewState": view_state})
             try:
                 detail = http.post(page, data=data, headers=self.AJAX_HEADERS)
             except requests.RequestException as exc:
@@ -990,6 +993,8 @@ class HandelsregisterSource(Source):
             view_state = new_vs or view_state
             if not text:
                 log.warning("[%s] empty detail text for %s (%s)", self.name, entry["id"], entry.get("company_name"))
+                log.debug("[%s] detail response (%d bytes): %s", self.name, len(detail.text),
+                          re.sub(r"\s+", " ", detail.text[:600]))
             entry["details"] = text or entry.get("original_text", "")
             yield announcement_from_rbk(entry, self.name, page)
 
@@ -1019,8 +1024,16 @@ class HandelsregisterSource(Source):
     @classmethod
     def find_remote_command(cls, soup: Any, raw: str) -> str:
         for script in soup.find_all("script"):
-            if script.get("id") and "fireBekanntmachung" in (script.string or script.get_text() or ""):
+            body = script.string or script.get_text() or ""
+            # current portal: <script id="...:j_idt173">remoteBekanntmachung = function() {PrimeFaces.ab({s:...
+            # older portal:   <script id="...:j_idt114">fireBekanntmachung2 = function() {PrimeFaces.ab({s:...
+            if script.get("id") and re.search(r"(?:remote|fire)Bekanntmachung\w*\s*=\s*function", body) \
+                    and "PrimeFaces.ab" in body:
                 return script["id"]
+        m = re.search(r"remoteBekanntmachung\s*=\s*function.*?PrimeFaces\.ab\(\s*\{\s*s\s*:\s*[\"']([^\"']+)",
+                      raw, re.DOTALL)
+        if m:
+            return m.group(1)
         m = re.search(r"fireBekanntmachung\d*\s*=\s*function.*?PrimeFaces\.ab\(\s*\{\s*s\s*:\s*[\"']([^\"']+)",
                       raw, re.DOTALL)
         if m:
