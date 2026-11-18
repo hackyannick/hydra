@@ -902,6 +902,7 @@ class HandelsregisterSource(Source):
     PAGE = "https://www.handelsregister.de/rp_web/xhtml/bekanntmachungen.xhtml"
     FORM = "bekanntMachungenForm"
     ONCLICK_RE = re.compile(r"fireBekanntmachung\d*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)")
+    REDIRECT_RE = re.compile(r'<redirect\s+url="([^"]+)"')
     AJAX_HEADERS = {
         "Faces-Request": "partial/ajax",
         "X-Requested-With": "XMLHttpRequest",
@@ -985,12 +986,18 @@ class HandelsregisterSource(Source):
                          self.FORM: self.FORM, "javax.faces.ViewState": view_state})
             try:
                 detail = http.post(page, data=data, headers=self.AJAX_HEADERS)
+                # current portal: the remote command answers with a redirect to a
+                # separate page (/rp_web/einzelBekanntmachung/welcome.xhtml)
+                redirect = self.REDIRECT_RE.search(detail.text)
+                if redirect:
+                    detail = http.get(RegisterPortal.BASE + html.unescape(redirect.group(1)))
             except requests.RequestException as exc:
                 log.warning("[%s] detail %s failed: %s", self.name, entry["id"], exc)
                 continue
             fetched += 1
             text, new_vs = self.parse_detail(detail.text)
-            view_state = new_vs or view_state
+            if not redirect:
+                view_state = new_vs or view_state
             if not text:
                 log.warning("[%s] empty detail text for %s (%s)", self.name, entry["id"], entry.get("company_name"))
                 log.debug("[%s] detail response (%d bytes): %s", self.name, len(detail.text),

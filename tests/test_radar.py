@@ -313,6 +313,18 @@ p:"bekanntMachungenForm",u:"bekanntMachungenForm",pa:arguments[0]});}</script>
         soup = radar.BeautifulSoup(page, "lxml")
         self.assertEqual(radar.HandelsregisterSource.find_remote_command(soup, page), "bekanntMachungenForm:j_idt173")
 
+    def test_detail_page_after_redirect(self):
+        """The portal answers detail requests with a redirect to this page (real, Nov 2026)."""
+        redirect = """<?xml version='1.0' encoding='UTF-8'?>
+<partial-response><redirect url="/rp_web/einzelBekanntmachung/welcome.xhtml"></redirect></partial-response>"""
+        m = radar.HandelsregisterSource.REDIRECT_RE.search(redirect)
+        self.assertEqual(m.group(1), "/rp_web/einzelBekanntmachung/welcome.xhtml")
+        text, _ = radar.HandelsregisterSource.parse_detail(
+            (FIX / "portal_einzelbekanntmachung.html").read_text(encoding="utf-8"))
+        self.assertTrue(text.startswith("17.11.2026 (Bekanntmachungsdatum)"))
+        self.assertIn("Löschungsankündigung", text)
+        self.assertIn("§ 394 FamFG", text)
+
     def test_ad_print_real_layout(self):
         """Real current print (AD) of handelsregister.de, anonymised, Swiss residence inserted."""
         text = (FIX / "portal_ad_print.text").read_text(encoding="utf-8")
